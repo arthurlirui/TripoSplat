@@ -13,7 +13,8 @@ pipe = TripoSplatPipeline(
     device                 = "cuda",
 )
 
-INPUT = "static/example_inputs/building_stone_house.webp"
+#INPUT = "static/example_inputs/building_stone_house.webp"
+INPUT = "static/example_inputs/26d2e846349647ff04c536816e0e8ca1.png"
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +24,8 @@ INPUT = "static/example_inputs/building_stone_house.webp"
 gaussian, prepared = pipe.run(INPUT, num_gaussians=262144, show_progress=True)
 
 prepared.save("preprocessed_image.webp")
-gaussian.save_ply("output.ply")
-gaussian.save_splat("output.splat")
+gaussian.save_ply("g1.ply")
+gaussian.save_splat("g1.splat")
 
 
 # ---------------------------------------------------------------------------

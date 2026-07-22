@@ -432,28 +432,144 @@ def _image_to_pil(image) -> Image.Image:
     raise TypeError(f"unsupported image type: {type(image)}")
 
 
-def preprocess_image(image, rmbg: BiRefNet, erode_radius: int = 1) -> Image.Image:
+
+# ---------------------------------------------------------------------------
+# Background reconstruction (monocular depth + inpainting)
+# ---------------------------------------------------------------------------
+
+def _estimate_depth(image, depth_estimator):
+    """Estimate monocular depth map for background reconstruction guidance."""
+    result = depth_estimator(image)
+    depth_map = result["predicted_depth"].squeeze().cpu().numpy().astype(np.float32)
+    dmin, dmax = depth_map.min(), depth_map.max()
+    if dmax > dmin:
+        depth_map = (depth_map - dmin) / (dmax - dmin)
+    if depth_map.shape[:2] != (image.height, image.width):
+        depth_pil = Image.fromarray((depth_map * 255).astype(np.uint8), mode="L")
+        depth_pil = depth_pil.resize((image.width, image.height), Image.BILINEAR)
+        depth_map = np.array(depth_pil, dtype=np.float32) / 255.0
+    return depth_map
+
+
+def _inpaint_foreground_regions(image_rgb, fg_mask, depth_map):
+    """Reconstruct the complete background using depth-guided iterative inpainting.
+
+    Strategy:
+        1. Compute each foreground pixel's distance to the nearest background
+           boundary via a distance transform.
+        2. Iteratively inpaint thin strips from the boundary inward so that
+           each pass uses the previously inpainted pixels as context.
+        3. Depth information refines the inpainting mask and adaptively
+           adjusts the inpainting radius per iteration.
+    """
+    import cv2
+
+    img_np = np.array(image_rgb, dtype=np.uint8)
+    mask_uint8 = (fg_mask > 0).astype(np.uint8) * 255
+
+    if mask_uint8.sum() == 0:
+        return image_rgb
+
+    # Depth-guided mask refinement
+    bg_pixels = fg_mask == 0
+    bg_depth_median = float(np.median(depth_map[bg_pixels])) if bg_pixels.any() else 0.5
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    dilated = cv2.dilate(mask_uint8, kernel, iterations=1)
+    depth_weight = np.exp(-3.0 * np.abs(depth_map - bg_depth_median))
+    refined_mask = np.where(
+        (dilated > 0) & (depth_weight > 0.5), dilated, mask_uint8
+    ).astype(np.uint8)
+
+    # Distance transform for iterative inpainting order
+    inv_mask = 255 - refined_mask
+    dist_from_bg = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
+    dist_from_bg[refined_mask == 0] = 0
+    max_dist = dist_from_bg.max()
+
+    if max_dist <= 0:
+        return image_rgb
+
+    # Iterative inpainting from boundary inward
+    result = img_np.copy()
+    num_iters = 6
+    for i in range(num_iters):
+        lo = max_dist * i / num_iters
+        hi = max_dist * (i + 1) / num_iters
+        iter_mask = ((dist_from_bg >= lo) & (dist_from_bg < hi)).astype(np.uint8) * 255
+        if iter_mask.sum() == 0:
+            continue
+        radius = int(3 + 12 * (i / max(num_iters - 1, 1)))
+        result = cv2.inpaint(result, iter_mask, inpaintRadius=radius,
+                             flags=cv2.INPAINT_TELEA)
+
+    return Image.fromarray(result, mode="RGB")
+
+
+def reconstruct_background(image, rmbg, depth_estimator):
+    """Reconstruct the complete background from a single RGB image.
+
+    Pipeline:
+        1. Estimate foreground mask via BiRefNet.
+        2. Estimate monocular depth map (Depth Anything V2).
+        3. Depth-guided iterative inpainting of foreground regions.
+    """
+    rgb = image.convert("RGB")
+
+    # Step 1: foreground mask
+    rgba = rmbg.remove_background(rgb)
+    alpha = np.array(rgba.getchannel(3), dtype=np.float32)
+    fg_mask = (alpha > 127).astype(np.float32)
+
+    # Step 2: monocular depth
+    depth_map = _estimate_depth(rgb, depth_estimator)
+
+    # Step 3: depth-guided inpainting
+    return _inpaint_foreground_regions(rgb, fg_mask, depth_map)
+
+def preprocess_image(image, rmbg: BiRefNet, erode_radius: int = 1,
+                     remove_background: bool = True) -> Image.Image:
+    """Preprocess an image for the TripoSplat pipeline.
+
+    Args:
+        image: Input image (file path / PIL.Image / torch.Tensor).
+        rmbg: BiRefNet background removal model.
+        erode_radius: Pixel radius for alpha matte erosion.
+        remove_background: When True (default), remove the background
+            and composite the foreground on black. When False, keep
+            the original image background intact (no alpha cropping).
+    """
     image = _image_to_pil(image)
     size = _CANVAS_SIZE
     w, h = image.size
     s = size / min(w, h)
     image = image.resize((max(1, int(round(w * s))), max(1, int(round(h * s)))), Image.LANCZOS)
-    has_real_alpha = (image.mode == "RGBA"
-                      and np.array(image.getchannel(3), dtype=np.int32).min() < 255)
-    if not has_real_alpha:
-        image = rmbg.remove_background(image.convert("RGB"))
-    if erode_radius > 0:
-        image.putalpha(image.getchannel(3).filter(ImageFilter.MinFilter(2 * erode_radius + 1)))
-    alpha = np.array(image.getchannel(3))
-    ys, xs = np.nonzero(alpha)
-    bbox = [xs.min(), ys.min(), xs.max(), ys.max()]
-    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-    half = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) / 2 * 1.2
-    image = image.crop([int(cx - half), int(cy - half), int(cx + half), int(cy + half)])
-    image = image.resize((size, size), Image.LANCZOS)
-    bg = Image.new("RGB", (size, size), (0, 0, 0))
-    bg.paste(image, mask=image.split()[3])
-    return bg
+
+    if remove_background:
+        has_real_alpha = (image.mode == "RGBA"
+                          and np.array(image.getchannel(3), dtype=np.int32).min() < 255)
+        if not has_real_alpha:
+            image = rmbg.remove_background(image.convert("RGB"))
+        if erode_radius > 0:
+            image.putalpha(image.getchannel(3).filter(ImageFilter.MinFilter(2 * erode_radius + 1)))
+        alpha = np.array(image.getchannel(3))
+        ys, xs = np.nonzero(alpha)
+        bbox = [xs.min(), ys.min(), xs.max(), ys.max()]
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        half = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) / 2 * 1.2
+        image = image.crop([int(cx - half), int(cy - half), int(cx + half), int(cy + half)])
+        image = image.resize((size, size), Image.LANCZOS)
+        bg = Image.new("RGB", (size, size), (0, 0, 0))
+        bg.paste(image, mask=image.split()[3])
+        return bg
+    else:
+        # Keep original background - resize and center-pad to square
+        image = image.convert("RGB")
+        w, h = image.size
+        new_size = max(w, h)
+        padded = Image.new("RGB", (new_size, new_size), (0, 0, 0))
+        padded.paste(image, ((new_size - w) // 2, (new_size - h) // 2))
+        return padded.resize((size, size), Image.LANCZOS)
 
 
 _DINOV3_NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -509,9 +625,35 @@ class TripoSplatPipeline:
         self.rmbg        = load_rmbg        (rmbg_path,               device=self._device, dtype=torch.float16)
         self.flow_model  = load_flow_model  (ckpt_path,               device=self._device, dtype=torch.float16)
         self.decoder     = load_decoder     (decoder_path,            device=self._device, dtype=torch.float16)
+        self._depth_estimator = None
+        self.last_reconstructed_background = None
 
-    def preprocess_image(self, image, erode_radius: int = 1) -> Image.Image:
-        return preprocess_image(image, self.rmbg, erode_radius=erode_radius)
+    @property
+    def depth_estimator(self):
+        """HuggingFace depth-estimation pipeline (Depth Anything V2 Small). Lazily loaded."""
+        if self._depth_estimator is None:
+            from transformers import pipeline as hf_pipeline
+            self._depth_estimator = hf_pipeline(
+                "depth-estimation",
+                model="depth-anything/Depth-Anything-V2-Small-hf",
+                device=self._device,
+            )
+        return self._depth_estimator
+
+    def reconstruct_background(self, image) -> Image.Image:
+        """Reconstruct the complete background from a single RGB image.
+
+        Uses monocular depth estimation (Depth Anything V2) combined with
+        depth-guided iterative inpainting (OpenCV Telea) to fill in the
+        foreground-occluded regions and produce a full background image.
+        """
+        image = _image_to_pil(image)
+        return reconstruct_background(image, self.rmbg, self.depth_estimator)
+
+    def preprocess_image(self, image, erode_radius: int = 1,
+                         remove_background: bool = True) -> Image.Image:
+        return preprocess_image(image, self.rmbg, erode_radius=erode_radius,
+                                remove_background=remove_background)
 
     def encode_image(self, image: Image.Image, generator: torch.Generator = None) -> dict:
         return encode_image(image, self.dinov3, self.vae_encoder, generator=generator)
@@ -543,6 +685,7 @@ class TripoSplatPipeline:
     @torch.no_grad()
     def run(self, image, seed: int = 42, steps: int = 20, guidance_scale: float = 3.0,
             shift: float = 3.0, num_gaussians=262144, erode_radius: int = 1,
+            remove_background: bool = True, reconstruct_bg: bool = False,
             show_progress: bool = False, callback=None):
         """
         Args:
@@ -588,8 +731,15 @@ class TripoSplatPipeline:
         else:
             counts = [self._validate_num_gaussians(num_gaussians)]
 
+        self.last_reconstructed_background = None
+
         gen = torch.Generator(device=self._device).manual_seed(seed)
-        prepared = self.preprocess_image(image, erode_radius=erode_radius)
+        prepared = self.preprocess_image(image, erode_radius=erode_radius,
+                                         remove_background=remove_background)
+
+        if remove_background and reconstruct_bg:
+            self.last_reconstructed_background = self.reconstruct_background(image)
+
         cond = self.encode_image(prepared, generator=gen)
         out = self.sample_latent(cond, steps=steps, guidance_scale=guidance_scale, shift=shift,
                                  generator=gen, show_progress=show_progress, callback=callback)

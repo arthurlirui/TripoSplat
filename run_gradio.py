@@ -62,6 +62,7 @@ def _viewer_iframe(ply_path: Path) -> str:
 
 def generate(image, seed: int, steps: int, guidance_scale: float,
              num_gaussians: int, output_format: str,
+             remove_background: bool, reconstruct_bg: bool,
              progress=gr.Progress(track_tqdm=True)):
     """Run the full pipeline (preprocess + encode + sample + decode)."""
     if image is None:
@@ -69,13 +70,16 @@ def generate(image, seed: int, steps: int, guidance_scale: float,
 
     progress(0, desc="Generating...")
     t0 = time.time()
-    prepared = PIPE.preprocess_image(image)
-    gen = torch.Generator(device=PIPE._device).manual_seed(int(seed))
-    cond = PIPE.encode_image(prepared, generator=gen)
-    out  = PIPE.sample_latent(cond, steps=int(steps),
-                              guidance_scale=float(guidance_scale),
-                              generator=gen, show_progress=True)
-    gaussian = PIPE.decode_latent(out["latent"], num_gaussians=int(num_gaussians))
+    gaussian, prepared = PIPE.run(
+        image,
+        seed=int(seed),
+        steps=int(steps),
+        guidance_scale=float(guidance_scale),
+        num_gaussians=int(num_gaussians),
+        remove_background=remove_background,
+        reconstruct_bg=reconstruct_bg,
+        show_progress=True,
+    )
     gen_dt = time.time() - t0
 
     out_dir = OUT_ROOT / uuid4().hex[:12]
@@ -94,7 +98,10 @@ def generate(image, seed: int, steps: int, guidance_scale: float,
 
     info = (f"{gaussian.get_xyz.shape[0]:,} gaussians  ·  "
             f"generation: {gen_dt:.1f}s  ·  saved: {download_path.name}")
-    return prepared, _viewer_iframe(ply_path), gr.update(value=str(download_path), interactive=True), info
+
+    # Include reconstructed background if available
+    reconstructed_bg = PIPE.last_reconstructed_background
+    return prepared, reconstructed_bg, _viewer_iframe(ply_path), gr.update(value=str(download_path), interactive=True), info
 
 
 # ----------------------------------------------------------------------------
@@ -133,8 +140,17 @@ with gr.Blocks(title="TripoSplat") as demo:
                 )
                 fmt_in = gr.Dropdown(label="Download format", choices=["ply", "splat"], value="ply")
 
+            with gr.Accordion("Background settings", open=False):
+                rmbg_in = gr.Checkbox(label="Remove background", value=True,
+                                       info="Off = keep original background in the 3D scene")
+                recon_bg_in = gr.Checkbox(label="Reconstruct background", value=False,
+                                           info="When background is removed, also reconstruct "
+                                                "the full background via depth estimation + inpainting")
+
             run_btn = gr.Button("Generate", variant="primary")
             prepared_out = gr.Image(label="Preprocessed input", interactive=False, height=240)
+            recon_bg_out = gr.Image(label="Reconstructed background", interactive=False, height=240,
+                                     visible=False)
             info_out = gr.Markdown()
 
         with gr.Column(scale=2):
@@ -143,8 +159,8 @@ with gr.Blocks(title="TripoSplat") as demo:
 
     run_btn.click(
         fn=generate,
-        inputs=[image_in, seed_in, steps_in, cfg_in, num_g_in, fmt_in],
-        outputs=[prepared_out, viewer_out, file_out, info_out],
+        inputs=[image_in, seed_in, steps_in, cfg_in, num_g_in, fmt_in, rmbg_in, recon_bg_in],
+        outputs=[prepared_out, recon_bg_out, viewer_out, file_out, info_out],
     )
 
 
