@@ -121,24 +121,14 @@ def refine_from_multiview(
     if verbose:
         print(f"  Init camera: cam_idx={init_camera.cam_idx}, file_path={init_camera.file_path}")
 
-    # ── Phase 3: Coordinate / scale alignment ──
+    # ── Phase 3: Multi-view silhouette alignment ──
     if verbose:
         print("\n" + "=" * 60)
-        print("Phase 3: Depth + silhouette ICP alignment")
+        print("Phase 3: Multi-view silhouette alignment")
+        print("  Render init Gaussians from all views → compare with real images")
         print("=" * 60)
 
-    # Load the init image at the same scale as the cameras.
-    init_image = init_camera.image  # (3, H, W) already loaded
-
-    # Get depth estimator from the pipeline.
-    depth_estimator = None
-    if hasattr(pipe, "depth_estimator"):
-        try:
-            depth_estimator = pipe.depth_estimator
-        except Exception:
-            depth_estimator = None
-
-    # Get background removal function for silhouette.
+    # Get background removal function for silhouette extraction.
     rmbg_fn = None
     if hasattr(pipe, "rmbg") and pipe.rmbg is not None:
         rmbg_fn = pipe.rmbg.remove_background
@@ -146,11 +136,12 @@ def refine_from_multiview(
     scale, R, t = estimate_similarity_transform(
         tripo_gaussian,
         init_camera,
-        init_image,
-        depth_estimator=depth_estimator,
+        init_camera.image,
+        depth_estimator=None,
         rmbg_fn=rmbg_fn,
-        n_icp_iterations=10,
-        max_points=5000,
+        cameras=cameras,
+        alpha_threshold=0.1,
+        verbose=verbose,
     )
 
     # ── Phase 4: Create refineable Gaussians ──

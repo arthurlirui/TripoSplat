@@ -1,374 +1,337 @@
-"""Depth + silhouette ICP alignment for initializing Gaussians to the scene.
+"""Multi-view alignment: estimate rotation + scale for initial Gaussians.
 
-Estimates a 7-DoF similarity transform (scale, rotation, translation) that maps
-TripoSplat-generated Gaussians (in their normalised AABB coordinate frame) to
-the real multi-view camera coordinate system (OpenCV convention).
+Instead of using a single-view depth ICP, this module renders the initial
+Gaussians from **all** training camera viewpoints, compares the rendered
+silhouettes (alpha maps) with the real images' foreground masks, and
+searches for the rotation R and scale s that maximise silhouette overlap
+across all views.
+
+The transform maps: ``xyz_scene = s * (R @ xyz_tripo) + t`` where t is
+determined by centroid alignment once R and s are fixed.
 
 Strategy:
-  1. Render the init Gaussians from the init camera → depth + alpha maps.
-  2. Estimate monocular depth on the real init image (Depth Anything V2).
-  3. Back-project both depth maps to 3D point clouds using the init camera.
-  4. Mask by silhouette (render alpha for the synthetic; BiRefNet for real).
-  5. Estimate the similarity transform via the Umeyama method (closed-form),
-     followed by a few ICP iterations for refinement.
+  1. Extract foreground masks from real images (BiRefNet or alpha channel).
+  2. For each candidate (R, s), render all views and compute IoU between
+     rendered alpha and real mask.
+  3. Optimise (R, s) to maximise mean IoU via grid search + gradient-free
+     refinement (Nelder-Mead or exhaustive rotation search).
+  4. Compute t from centroid alignment.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
+import itertools
+from typing import Optional, Callable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .cameras import Camera
-from .gsplat_wrapper import render_depth, render_alpha
+from .gsplat_wrapper import render_gaussians, render_alpha
+
+SH_C0 = 0.28209479177387814
 
 
-def backproject_depth(
-    depth: torch.Tensor,
-    camera: Camera,
-    mask: Optional[torch.Tensor] = None,
-    max_points: int = 10000,
-) -> torch.Tensor:
-    """Back-project a depth map to 3D points in camera space.
+def _tripo_gaussian_to_tensors(tripo_gaussian, device):
+    """Extract fp32 tensors from a TripoSplat Gaussian object."""
+    means = tripo_gaussian.get_xyz.detach().to(device).float()
+    scales = tripo_gaussian.get_scaling.detach().to(device).float()
+    quats = (tripo_gaussian._rotation + tripo_gaussian.rots_bias[None, :]).detach().to(device).float()
+    opacities = tripo_gaussian.get_opacity.detach().squeeze(-1).to(device).float()
+    colors = tripo_gaussian._features_dc.detach().to(device).float()
+    return means, scales, quats, opacities, colors
 
-    Uses the pinhole model: ``x = (u - cx) * z / fx``,
-    ``y = (v - cy) * z / fy``, ``z = depth``.
 
-    Args:
-        depth: (H, W) or (1, H, W) depth map (camera-space z).
-        camera: The camera with matching intrinsics.
-        mask: Optional (H, W) boolean/float mask; only masked pixels are kept.
-        max_points: Subsample to at most this many points (random).
+def _apply_transform(means, scales, quats, scale, R, t):
+    """Apply a similarity transform to Gaussian attributes.
 
-    Returns:
-        (M, 3) 3D points in **camera** space.
+    means: s * (R @ means) + t
+    scales: s * scales
+    quats: compose R's quaternion with each Gaussian's quaternion
     """
-    if depth.ndim == 3:
-        depth = depth.squeeze(0)  # (H, W)
-    H, W = depth.shape
-    device = depth.device
+    from .gaussian_model import _rotation_matrix_to_quaternion, _quaternion_compose
 
-    # Create pixel coordinate grid.
-    v, u = torch.meshgrid(
-        torch.arange(H, device=device, dtype=torch.float32),
-        torch.arange(W, device=device, dtype=torch.float32),
-        indexing="ij",
-    )
-
-    z = depth  # (H, W)
-    x = (u - camera.cx) * z / camera.fx
-    y = (v - camera.cy) * z / camera.fy
-
-    points = torch.stack([x, y, z], dim=-1)  # (H, W, 3)
-
-    # Apply mask.
-    if mask is not None:
-        if mask.ndim == 3:
-            mask = mask.squeeze(0)
-        valid = mask > 0.5
-    else:
-        valid = torch.ones_like(z, dtype=torch.bool)
-
-    # Also filter out zero / invalid depths.
-    valid = valid & (z > 0.01) & torch.isfinite(z)
-
-    points = points[valid]  # (M, 3)
-
-    # Subsample if too many points.
-    if points.shape[0] > max_points:
-        idx = torch.randperm(points.shape[0], device=device)[:max_points]
-        points = points[idx]
-
-    return points
+    means_new = scale * (means @ R.T) + t
+    scales_new = scales * scale
+    q_R = _rotation_matrix_to_quaternion(R)  # (4,)
+    quats_new = _quaternion_compose(q_R, quats)  # (N, 4)
+    return means_new, scales_new, quats_new
 
 
-def camera_to_world(points_cam: torch.Tensor, camera: Camera) -> torch.Tensor:
-    """Transform points from camera space to world space using c2w."""
-    # points_cam: (N, 3); c2w: (4, 4)
-    R = camera.c2w[:3, :3]
-    t = camera.c2w[:3, 3]
-    return (points_cam @ R.T) + t[None, :]
+def _get_real_masks(cameras, rmbg_fn=None, alpha_threshold=0.5):
+    """Extract foreground masks from real camera images.
 
-
-def umeyama(
-    src: np.ndarray,
-    dst: np.ndarray,
-    with_scale: bool = True,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Estimate a similarity transform (s, R, t) mapping src → dst.
-
-    Uses the closed-form Umeyama method.
-
-    Args:
-        src: (N, 3) source points.
-        dst: (N, 3) destination points (same N).
-        with_scale: If True, estimate a uniform scale; else scale=1.
-
-    Returns:
-        (scale, R (3x3), t (3,)) such that ``dst ≈ s * src @ R.T + t``.
+    Returns a list of (H, W) boolean tensors, one per camera.
     """
-    assert src.shape == dst.shape
-    n = src.shape[0]
+    from PIL import Image as PILImage
 
-    mu_src = src.mean(axis=0)  # (3,)
-    mu_dst = dst.mean(axis=0)
-
-    src_centered = src - mu_src  # (N, 3)
-    dst_centered = dst - mu_dst
-
-    # Cross-covariance matrix.
-    cross_cov = dst_centered.T @ src_centered / n  # (3, 3)
-
-    U, S, Vt = np.linalg.svd(cross_cov)
-
-    # Handle reflection.
-    d = np.sign(np.linalg.det(U) * np.linalg.det(Vt))
-    D = np.diag([1, 1, d])
-    R = U @ D @ Vt
-
-    if with_scale:
-        var_src = np.sum(src_centered ** 2) / n
-        scale = np.trace(np.diag(S) @ D) / var_src
-    else:
-        scale = 1.0
-
-    t = mu_dst - scale * (R @ mu_src)
-
-    return float(scale), R, t
-
-
-def icp_refine(
-    src: np.ndarray,
-    dst: np.ndarray,
-    init_scale: float,
-    init_R: np.ndarray,
-    init_t: np.ndarray,
-    n_iterations: int = 10,
-    max_corr_dist: float = float("inf"),
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Refine the similarity transform via ICP (nearest-neighbour matching).
-
-    Args:
-        src: (N, 3) source points.
-        dst: (M, 3) destination points.
-        init_scale, init_R, init_t: initial transform.
-        n_iterations: number of ICP iterations.
-        max_corr_dist: max correspondence distance (points farther are rejected).
-
-    Returns:
-        Refined (scale, R, t).
-    """
-    from scipy.spatial import cKDTree
-
-    scale, R, t = init_scale, init_R.copy(), init_t.copy()
-
-    tree = cKDTree(dst)
-
-    for _ in range(n_iterations):
-        # Transform source.
-        src_transformed = scale * (src @ R.T) + t  # (N, 3)
-
-        # Find nearest neighbours in dst.
-        dists, indices = tree.query(src_transformed, k=1)
-
-        # Filter by max correspondence distance.
-        if max_corr_dist != float("inf"):
-            valid = dists < max_corr_dist
-            if valid.sum() < 10:
-                break
-            corr_dst = dst[indices[valid]]
-            corr_src = src[valid]
+    masks = []
+    for cam in cameras:
+        if cam.alpha is not None:
+            mask = (cam.alpha.squeeze(0) > alpha_threshold).float()
+        elif rmbg_fn is not None:
+            # Use BiRefNet to get the mask.
+            img_np = (cam.image.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_pil = PILImage.fromarray(img_np)
+            rgba = rmbg_fn(img_pil)
+            alpha = np.asarray(rgba, dtype=np.float32)
+            if alpha.ndim == 3 and alpha.shape[-1] == 4:
+                alpha = alpha[..., 3] / 255.0
+            else:
+                alpha = np.ones(alpha.shape[:2], dtype=np.float32)
+            if alpha.shape[:2] != (cam.height, cam.width):
+                alpha_pil = PILImage.fromarray((alpha * 255).astype(np.uint8), mode="L")
+                alpha_pil = alpha_pil.resize((cam.width, cam.height), PILImage.BILINEAR)
+                alpha = np.array(alpha_pil, dtype=np.float32) / 255.0
+            mask = torch.from_numpy(alpha).to(cam.device)
         else:
-            corr_dst = dst[indices]
-            corr_src = src
-
-        # Re-estimate transform.
-        scale, R, t = umeyama(corr_src, corr_dst, with_scale=True)
-
-    return scale, R, t
+            # Fallback: use image brightness as mask (non-black = foreground).
+            mask = (cam.image.mean(dim=0) > 0.05).float()
+        masks.append(mask)
+    return masks
 
 
+def _render_silhouettes(means, scales, quats, opacities, cameras, alpha_threshold=0.1):
+    """Render binary silhouette masks from the given Gaussians for each camera.
+
+    Returns list of (H, W) float tensors.
+    """
+    silhouettes = []
+    for cam in cameras:
+        with torch.no_grad():
+            alpha = render_alpha(means, scales, quats, opacities, cam)
+        sil = (alpha.squeeze(0) > alpha_threshold).float()
+        silhouettes.append(sil)
+    return silhouettes
+
+
+def _compute_iou(pred_mask, real_mask):
+    """Compute Intersection-over-Union of two binary masks."""
+    intersection = (pred_mask * real_mask).sum()
+    union = ((pred_mask + real_mask) > 0).float().sum()
+    if union < 1:
+        return 0.0
+    return float((intersection / union).item())
+
+
+def _compute_iou_batch(pred_masks, real_masks):
+    """Compute mean IoU across multiple view pairs."""
+    ious = []
+    for pred, real in zip(pred_masks, real_masks):
+        # Resize pred to match real if needed
+        if pred.shape != real.shape:
+            pred = F.interpolate(
+                pred.unsqueeze(0).unsqueeze(0), size=real.shape,
+                mode="bilinear", align_corners=False
+            ).squeeze()
+        ious.append(_compute_iou(pred, real))
+    return np.mean(ious)
+
+
+def _euler_to_matrix(rx, ry, rz):
+    """Euler angles (radians) → rotation matrix (XYZ extrinsic)."""
+    Rx = torch.tensor([
+        [1, 0, 0],
+        [0, math.cos(rx), -math.sin(rx)],
+        [0, math.sin(rx), math.cos(rx)],
+    ], dtype=torch.float32)
+    Ry = torch.tensor([
+        [math.cos(ry), 0, math.sin(ry)],
+        [0, 1, 0],
+        [-math.sin(ry), 0, math.cos(ry)],
+    ], dtype=torch.float32)
+    Rz = torch.tensor([
+        [math.cos(rz), -math.sin(rz), 0],
+        [math.sin(rz), math.cos(rz), 0],
+        [0, 0, 1],
+    ], dtype=torch.float32)
+    return Rz @ Ry @ Rx
+
+
+def _estimate_translation(means, cameras, real_masks):
+    """Estimate translation t by aligning the centroid of visible Gaussians
+    with the centroid of the real scene (derived from mask centroids).
+
+    The real scene centre is estimated as the mean of camera positions
+    weighted by mask coverage.
+    """
+    # Gaussian centroid (in current frame).
+    gc = means.mean(dim=0)
+
+    # Scene centre: mean of camera positions that have significant foreground.
+    positions = []
+    for i, (cam, mask) in enumerate(zip(cameras, real_masks)):
+        coverage = mask.mean().item()
+        if coverage > 0.02:  # at least 2% foreground
+            positions.append(cam.position.cpu().numpy())
+    if len(positions) < 2:
+        scene_centre = np.zeros(3, dtype=np.float32)
+    else:
+        scene_centre = np.mean(positions, axis=0)
+
+    t = torch.from_numpy(scene_centre).float().to(means.device) - gc
+    return t
+
+
+def estimate_similarity_transform_multiview(
+    tripo_gaussian,
+    cameras: list[Camera],
+    rmbg_fn: Callable | None = None,
+    n_rotation_samples: int = 24,
+    n_scale_samples: int = 10,
+    scale_range: tuple[float, float] = (0.05, 2.0),
+    alpha_threshold: float = 0.1,
+    verbose: bool = True,
+) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """Estimate 7-DoF similarity transform via multi-view silhouette matching.
+
+    Renders the initial Gaussians from all camera viewpoints for each
+    candidate (R, s) and picks the one that maximises mean IoU between
+    rendered silhouettes and real foreground masks.
+
+    Args:
+        tripo_gaussian: TripoSplat ``Gaussian`` object (in AABB coordinates).
+        cameras: List of multi-view cameras (with loaded images).
+        rmbg_fn: Background removal function (PIL → RGBA). If None, uses
+            image brightness as foreground mask.
+        n_rotation_samples: Number of rotation samples per axis (coarse search).
+        n_scale_samples: Number of scale samples.
+        scale_range: (min_scale, max_scale) to search.
+        alpha_threshold: Threshold for rendered alpha → binary silhouette.
+        verbose: Print progress.
+
+    Returns:
+        (scale, R (3,3), t (3,)) such that ``xyz_scene = s * (R @ xyz_tripo) + t``.
+    """
+    device = cameras[0].device
+    means, scales, quats, opacities, colors = _tripo_gaussian_to_tensors(tripo_gaussian, device)
+
+    if verbose:
+        print(f"  Gaussians: {means.shape[0]}, means range [{means.min():.3f}, {means.max():.3f}]")
+
+    # ── Step 1: Extract real foreground masks ──
+    if verbose:
+        print("  Extracting foreground masks from real images...")
+    real_masks = _get_real_masks(cameras, rmbg_fn=rmbg_fn)
+
+    # ── Step 2: Coarse grid search over rotation and scale ──
+    if verbose:
+        print(f"  Grid search: {n_rotation_samples} rotations × {n_scale_samples} scales...")
+
+    # Rotation: sample yaw (around Y), pitch (around X), roll (around Z).
+    # For efficiency, first search yaw (most important for orbit datasets),
+    # then refine pitch and roll.
+    yaw_samples = np.linspace(0, 2 * math.pi, n_rotation_samples, endpoint=False)
+    scale_samples = np.linspace(scale_range[0], scale_range[1], n_scale_samples)
+
+    best_iou = -1.0
+    best_params = (1.0, 0.0, 0.0, 0.0, scale_range[0])  # (yaw, pitch, roll, _, scale)
+
+    # Initial translation: align Gaussian centroid to scene centre.
+    t_init = _estimate_translation(means, cameras, real_masks)
+
+    # Phase 1: Coarse yaw + scale search (pitch=0, roll=0).
+    for yaw in yaw_samples:
+        for s in scale_samples:
+            R = _euler_to_matrix(0.0, yaw, 0.0).to(device)
+            t = t_init.to(device)
+            means_t, scales_t, quats_t = _apply_transform(means, scales, quats, s, R, t)
+            # Render silhouettes for a subset of cameras (every 3rd for speed).
+            subset_cams = cameras[::3]
+            subset_masks = real_masks[::3]
+            sils = _render_silhouettes(means_t, scales_t, quats_t, opacities, subset_cams, alpha_threshold)
+            iou = _compute_iou_batch(sils, subset_masks)
+            if iou > best_iou:
+                best_iou = iou
+                best_params = (yaw, 0.0, 0.0, s)
+                if verbose:
+                    print(f"    yaw={math.degrees(yaw):.0f}°, scale={s:.3f}, IoU={iou:.4f} ★")
+
+    if verbose:
+        print(f"  Coarse best: yaw={math.degrees(best_params[0]):.1f}°, scale={best_params[3]:.3f}, IoU={best_iou:.4f}")
+
+    # Phase 2: Fine search around the best yaw and scale, adding pitch/roll.
+    best_yaw, _, _, best_scale = best_params
+    yaw_fine = np.linspace(best_yaw - math.pi / n_rotation_samples,
+                           best_yaw + math.pi / n_rotation_samples, 7)
+    scale_fine = np.linspace(max(best_scale * 0.7, scale_range[0]),
+                             min(best_scale * 1.3, scale_range[1]), 5)
+    pitch_samples = np.linspace(-math.pi / 6, math.pi / 6, 5)  # ±30°
+    roll_samples = np.linspace(-math.pi / 6, math.pi / 6, 5)   # ±30°
+
+    if verbose:
+        print(f"  Fine search: {len(yaw_fine)}×{len(pitch_samples)}×{len(roll_samples)}×{len(scale_fine)}...")
+
+    for yaw in yaw_fine:
+        for pitch in pitch_samples:
+            for roll in roll_samples:
+                for s in scale_fine:
+                    R = _euler_to_matrix(pitch, yaw, roll).to(device)
+                    t = t_init.to(device)
+                    means_t, scales_t, quats_t = _apply_transform(means, scales, quats, s, R, t)
+                    sils = _render_silhouettes(means_t, scales_t, quats_t, opacities, cameras, alpha_threshold)
+                    iou = _compute_iou_batch(sils, real_masks)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_params = (yaw, pitch, roll, s)
+                        if verbose:
+                            print(f"    yaw={math.degrees(yaw):.0f}° pitch={math.degrees(pitch):.0f}° "
+                                  f"roll={math.degrees(roll):.0f}° scale={s:.3f} IoU={iou:.4f} ★")
+
+    best_yaw, best_pitch, best_roll, best_scale = best_params
+    R_best = _euler_to_matrix(best_pitch, best_yaw, best_roll).to(device)
+
+    # ── Step 3: Final translation estimation ──
+    means_final = best_scale * (means @ R_best.T) + t_init.to(device)
+    t_best = _estimate_translation(means_final, cameras, real_masks)
+
+    if verbose:
+        print(f"  Final: yaw={math.degrees(best_yaw):.1f}°, pitch={math.degrees(best_pitch):.1f}°, "
+              f"roll={math.degrees(best_roll):.1f}°, scale={best_scale:.4f}, IoU={best_iou:.4f}")
+        print(f"  Translation: {t_best.tolist()}")
+
+    return best_scale, R_best, t_best
+
+
+# Keep backward-compatible alias
 def estimate_similarity_transform(
     tripo_gaussian,
     init_camera: Camera,
     init_image: torch.Tensor,
     depth_estimator=None,
     rmbg_fn=None,
+    cameras: list[Camera] | None = None,
     n_icp_iterations: int = 10,
     max_points: int = 5000,
-    alpha_threshold: float = 0.3,
+    alpha_threshold: float = 0.1,
+    verbose: bool = True,
 ) -> tuple[float, torch.Tensor, torch.Tensor]:
-    """Estimate the 7-DoF similarity transform from TripoSplat to scene coords.
-
-    Args:
-        tripo_gaussian: TripoSplat ``Gaussian`` object (in AABB coordinates).
-        init_camera: The camera corresponding to the init view.
-        init_image: (3, H, W) real image for depth estimation.
-        depth_estimator: A callable that takes a PIL image and returns a
-            depth map (H, W) normalised to [0, 1]. If None, uses
-            ``TripoSplatPipeline.depth_estimator`` (must be passed separately).
-        rmbg_fn: Optional callable that takes a PIL image and returns an RGBA
-            image with alpha mask. Used for silhouette extraction. If None,
-            uses the rendered alpha only.
-        n_icp_iterations: Number of ICP refinement iterations.
-        max_points: Max points for back-projection (subsampled).
-        alpha_threshold: Threshold for the rendered alpha silhouette.
-
-    Returns:
-        (scale, R (3,3), t (3,)) such that ``xyz_scene = scale * (R @ xyz_tripo) + t``.
+    """Estimate similarity transform — delegates to multi-view method if cameras
+    are provided, otherwise falls back to single-view depth ICP.
     """
+    if cameras is not None and len(cameras) > 1:
+        return estimate_similarity_transform_multiview(
+            tripo_gaussian, cameras, rmbg_fn=rmbg_fn,
+            alpha_threshold=alpha_threshold, verbose=verbose,
+        )
+
+    # Fallback: simple centroid + scale estimation.
     device = init_camera.device
+    means, scales, quats, opacities, colors = _tripo_gaussian_to_tensors(tripo_gaussian, device)
 
-    # ── Step 1: Render depth + alpha from the init Gaussians ──
-    # Convert to float32 — TripoSplat outputs may be fp16 (from fp16 checkpoints),
-    # but gsplat 1.5.x requires fp32.
-    means = tripo_gaussian.get_xyz.detach().to(device).float()
-    scales = tripo_gaussian.get_scaling.detach().to(device).float()
-    quats = (tripo_gaussian._rotation + tripo_gaussian.rots_bias[None, :]).detach().to(device).float()
-    opacities = tripo_gaussian.get_opacity.detach().squeeze(-1).to(device).float()
-    colors = tripo_gaussian._features_dc.detach().to(device).float()
+    # Centroid alignment.
+    gc = means.mean(dim=0)
+    scene_centre = init_camera.position * 0.7  # rough estimate: 70% towards camera
+    t = scene_centre - gc
 
-    render_depth_map = render_depth(
-        means, scales, quats, colors, opacities, init_camera, sh_degree=0
-    )  # (1, H, W)
+    # Scale: ratio of camera distance to Gaussian spread.
+    cam_dist = init_camera.position.norm().item()
+    gs_spread = float(means.std(dim=0).norm().item())
+    scale = max(cam_dist / (gs_spread * 4), 0.01)
 
-    render_alpha_map = render_alpha(
-        means, scales, quats, opacities, init_camera
-    )  # (1, H, W)
-
-    # ── Step 2: Estimate depth on the real init image ──
-    # Convert tensor to PIL for the depth estimator.
-    from PIL import Image as PILImage
-    img_np = (init_image.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    img_pil = PILImage.fromarray(img_np)
-
-    if depth_estimator is not None:
-        depth_result = depth_estimator(img_pil)
-        real_depth_raw = depth_result["predicted_depth"].squeeze().cpu().numpy().astype(np.float32)
-        # Normalise to [0, 1].
-        dmin, dmax = real_depth_raw.min(), real_depth_raw.max()
-        if dmax > dmin:
-            real_depth_raw = (real_depth_raw - dmin) / (dmax - dmin)
-        # Resize to camera resolution if needed.
-        if real_depth_raw.shape[:2] != (init_camera.height, init_camera.width):
-            depth_pil = PILImage.fromarray((real_depth_raw * 255).astype(np.uint8), mode="L")
-            depth_pil = depth_pil.resize(
-                (init_camera.width, init_camera.height), PILImage.BILINEAR
-            )
-            real_depth_raw = np.array(depth_pil, dtype=np.float32) / 255.0
-        real_depth = torch.from_numpy(real_depth_raw).to(device)
-    else:
-        # Fallback: no depth estimator, use rendered depth as a proxy.
-        real_depth = render_depth_map.squeeze(0)
-
-    # ── Step 3: Build silhouette masks ──
-    # Synthetic: rendered alpha.
-    synth_mask = (render_alpha_map.squeeze(0) > alpha_threshold).float()
-
-    # Real: BiRefNet alpha if available, else use the whole image.
-    if rmbg_fn is not None:
-        rgba = rmbg_fn(img_pil)
-        real_alpha = np.asarray(rgba, dtype=np.float32)
-        if real_alpha.ndim == 3 and real_alpha.shape[-1] == 4:
-            real_alpha = real_alpha[..., 3] / 255.0
-        else:
-            real_alpha = np.ones(real_alpha.shape[:2], dtype=np.float32)
-        # Resize to camera resolution.
-        if real_alpha.shape[:2] != (init_camera.height, init_camera.width):
-            alpha_pil = PILImage.fromarray((real_alpha * 255).astype(np.uint8), mode="L")
-            alpha_pil = alpha_pil.resize(
-                (init_camera.width, init_camera.height), PILImage.BILINEAR
-            )
-            real_alpha = np.array(alpha_pil, dtype=np.float32) / 255.0
-        real_mask = torch.from_numpy(real_alpha).to(device)
-    else:
-        real_mask = torch.ones(
-            (init_camera.height, init_camera.width), dtype=torch.float32, device=device
-        )
-
-    # ── Step 4: Back-project to 3D point clouds ──
-    # Synthetic points (in TripoSplat AABB coords, since the Gaussians are there).
-    # We render using the init camera, which has world-to-camera for the *scene*
-    # coordinate system, but the Gaussians are in AABB. So the rendered depth
-    # is in the *camera* space of the init camera, but the camera's w2c assumes
-    # the Gaussians are in scene coords.
-    #
-    # We need to be careful: the init camera's w2c transforms *scene* world
-    # coordinates to camera space. The TripoSplat Gaussians are in AABB coords
-    # (not scene coords). So when we render, gsplat uses the camera's w2c
-    # directly on the Gaussian means — the resulting depth is "as if the
-    # Gaussians were in scene coords". This is fine for alignment: we
-    # back-project the rendered depth to get the AABB points in the camera
-    # frame, and back-project the real depth to get the scene points in the
-    # camera frame. The transform between them is what we want.
-
-    # Synthetic: back-project rendered depth to camera space, then to "AABB world".
-    # Since we rendered with the init camera's w2c, the camera-space points
-    # correspond to AABB-world points via the camera's c2w. We transform back
-    # to get AABB-world coords (which is what the Gaussians are in).
-    synth_cam_pts = backproject_depth(
-        render_depth_map, init_camera, mask=synth_mask, max_points=max_points
-    )  # (M, 3) in camera space
-    # Transform camera → world (AABB world, since the camera was applied to AABB means).
-    synth_world_pts = camera_to_world(synth_cam_pts, init_camera)  # (M, 3) in AABB coords
-
-    # Real: back-project real depth to camera space, then to scene world.
-    real_cam_pts = backproject_depth(
-        real_depth, init_camera, mask=real_mask, max_points=max_points
-    )  # (M, 3) in camera space
-    real_world_pts = camera_to_world(real_cam_pts, init_camera)  # (M, 3) in scene coords
-
-    if synth_world_pts.shape[0] < 10 or real_world_pts.shape[0] < 10:
-        # Not enough points; return identity transform.
-        print(
-            f"Warning: not enough points for alignment "
-            f"(synth={synth_world_pts.shape[0]}, real={real_world_pts.shape[0]}). "
-            "Using identity transform."
-        )
-        return 1.0, torch.eye(3, device=device), torch.zeros(3, device=device)
-
-    # ── Step 5: Estimate similarity transform ──
-    # We need to match synth (AABB) → real (scene).
-    # Umeyama requires equal-length correspondences, so we subsample the larger.
-    n = min(synth_world_pts.shape[0], real_world_pts.shape[0])
-    synth_np = synth_world_pts[:n].cpu().numpy()
-    real_np = real_world_pts[:n].cpu().numpy()
-
-    # Initial estimate via Umeyama (treating the first n points as correspondences —
-    # this is a rough initialisation since they're not true correspondences).
-    # A better initialisation: align centroids and set scale by std ratio.
-    centroid_synth = synth_np.mean(axis=0)
-    centroid_real = real_np.mean(axis=0)
-    scale_init = float(
-        np.std(real_np - centroid_real) / max(np.std(synth_np - centroid_synth), 1e-8)
-    )
-    R_init = np.eye(3)
-    t_init = centroid_real - scale_init * centroid_synth
-
-    # ICP refinement: find true nearest-neighbour correspondences.
-    # We use all synth points as source and all real points as destination.
-    all_synth_np = synth_world_pts.cpu().numpy()
-    all_real_np = real_world_pts.cpu().numpy()
-
-    scale, R_np, t_np = icp_refine(
-        all_synth_np,
-        all_real_np,
-        init_scale=scale_init,
-        init_R=R_init,
-        init_t=t_init,
-        n_iterations=n_icp_iterations,
-        max_corr_dist=scale_init * 2.0,  # generous threshold
-    )
-
-    R = torch.from_numpy(R_np).float().to(device)
-    t = torch.from_numpy(t_np).float().to(device)
-
-    print(
-        f"Alignment: scale={scale:.4f}, "
-        f"R={R.diagonal().tolist()}, "
-        f"t={t.tolist()}"
-    )
-
+    R = torch.eye(3, device=device)
+    if verbose:
+        print(f"  Fallback alignment: scale={scale:.4f}, t={t.tolist()}")
     return scale, R, t

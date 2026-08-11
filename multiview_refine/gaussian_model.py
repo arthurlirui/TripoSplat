@@ -155,10 +155,15 @@ class RefineableGaussians(nn.Module):
         xyz = g.get_xyz.detach().to(device).float()  # (N, 3) in AABB
         means = (scale * (xyz @ R.T) + t).contiguous()
 
-        # ── Scales: apply scale factor, convert to log-space ──
+        # ── Scales: apply scale factor, enforce minimum, convert to log-space ──
         # The similarity transform scales all distances by `scale`, so
-        # activated scales should be multiplied by `scale` too.
+        # activated scales should be multiplied by `scale` too. We also
+        # enforce a minimum scale relative to the scene extent so that
+        # Gaussians are not sub-pixel at any training view.
         scales_activated = g.get_scaling.detach().to(device).float() * scale  # (N, 3)
+        # Minimum scale = 0.1% of scene extent (ensures visibility at all views)
+        min_scale = 0.001 * abs(scale) * 3.0  # rough scene size estimate
+        scales_activated = scales_activated.clamp_min(min_scale)
         scales_raw = torch.log(scales_activated.clamp_min(1e-8)).contiguous()
 
         # ── Quaternions: rotate by R ──
@@ -183,6 +188,9 @@ class RefineableGaussians(nn.Module):
         opacities_raw = torch.log(opac_activated / (1 - opac_activated)).contiguous()
 
         # ── SH DC coefficients: copy directly ──
+        # gsplat 1.5.x's rasterization() adds the +0.5 bias internally
+        # (rendering.py line 525: `colors = clamp_min(colors + 0.5, 0)`),
+        # so we store the standard 3DGS SH DC coefficients as-is.
         sh0 = g._features_dc.detach().to(device).float().contiguous()  # (N, 1, 3)
 
         # ── Higher-order SH: zeros (TripoSplat is degree 0) ──
@@ -267,18 +275,28 @@ class RefineableGaussians(nn.Module):
         self.lr_means_init = lr_means
         self.lr_means_final = 1.6e-6 * scene_scale
         self.lr_means_max_steps = 30000
+        # Initialize the persistent params dict so the strategy can modify it
+        # in-place during densification.
+        self._params_dict = None
 
     def get_params(self) -> dict[str, nn.Parameter]:
-        """Return the params dict expected by gsplat's strategy."""
-        params = {
-            "means": self._means,
-            "scales": self._scales,
-            "quats": self._quats,
-            "opacities": self._opacities,
-            "sh0": self._sh0,
-            "shN": self._shN,
-        }
-        return params
+        """Return the params dict expected by gsplat's strategy.
+
+        This dict is **persistent** — it is created once and updated in-place
+        by the strategy during densification. The model's ``_means`` etc. are
+        kept in sync via ``_sync_params_from_dict()`` after each densification
+        step.
+        """
+        if not hasattr(self, "_params_dict") or self._params_dict is None:
+            self._params_dict = {
+                "means": self._means,
+                "scales": self._scales,
+                "quats": self._quats,
+                "opacities": self._opacities,
+                "sh0": self._sh0,
+                "shN": self._shN,
+            }
+        return self._params_dict
 
     def get_colors(self) -> torch.Tensor:
         """Return SH coefficients for gsplat rasterization.
@@ -328,7 +346,12 @@ class RefineableGaussians(nn.Module):
             opt.zero_grad()
 
     def _sync_params_from_dict(self):
-        """Sync parameter tensors back from the params dict after densification."""
+        """Sync parameter tensors back from the params dict after densification.
+
+        The strategy replaces entries in the params dict with new nn.Parameters
+        during clone/split/prune. We sync them back to the model's attributes
+        so that the next render call uses the updated parameters.
+        """
         params = self.get_params()
         self._means = params["means"]
         self._scales = params["scales"]
@@ -336,6 +359,10 @@ class RefineableGaussians(nn.Module):
         self._opacities = params["opacities"]
         self._sh0 = params["sh0"]
         self._shN = params["shN"]
+        # Also update the optimizer param_groups to point to the new parameters.
+        for name, opt in self.optimizers.items():
+            if name in params:
+                opt.param_groups[0]["params"] = [params[name]]
 
     # ── Export ──────────────────────────────────────────────────────────
 
@@ -401,7 +428,7 @@ class RefineableGaussians(nn.Module):
         scales = self._scales.exp().detach().cpu().numpy()
         opacities = torch.sigmoid(self._opacities).detach().cpu().numpy()
         quats = F.normalize(self._quats, dim=-1).detach().cpu().numpy()
-        # SH DC -> RGB: rgb = f_dc * C0 + 0.5
+        # SH DC -> RGB: rgb = f_dc * C0 + 0.5 (standard 3DGS convention).
         sh0 = self._sh0.detach().cpu().numpy()  # (N, 1, 3)
         rgb = (sh0[:, 0, :] * SH_C0 + 0.5).clip(0, 1)
 
