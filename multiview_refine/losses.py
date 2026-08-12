@@ -45,33 +45,45 @@ def ssim(
     """Structural Similarity Index (SSIM) between two images.
 
     Uses a Gaussian-windowed SSIM implementation. Accepts (3, H, W) or
-    (C, 3, H, W) tensors.
-
-    Args:
-        img1, img2: images to compare, float32 in [0, data_range].
-        win_size:   size of the Gaussian window.
-        data_range: dynamic range of the images (1.0 for [0,1]).
-
-    Returns:
-        Scalar SSIM value (higher is better, max = 1).
+    (C, 3, H, W) tensors. Implemented directly to avoid torchmetrics
+    dependency issues (torchmetrics.text imports transformers).
     """
     # Ensure 4D: (C, channels, H, W)
     if img1.ndim == 3:
         img1 = img1.unsqueeze(0)
         img2 = img2.unsqueeze(0)
-    # Ensure both on same device.
     img2 = img2.to(img1.device)
-    # torchmetrics SSIM expects (C, channels, H, W) with float in [0, 1].
-    try:
-        from torchmetrics.functional.image import structural_similarity_index_measure
-    except ImportError:
-        from torchmetrics.functional import structural_similarity_index_measure
-    return structural_similarity_index_measure(
-        img1, img2,
-        kernel_size=win_size,
-        data_range=data_range,
-        reduction="elementwise_mean",
-    )
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    # Create Gaussian kernel.
+    sigma = 1.5
+    coords = torch.arange(win_size, dtype=torch.float32, device=img1.device) - win_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    # 2D kernel: (win_size, win_size)
+    kernel2d = g[:, None] * g[None, :]
+    # Expand to (channels, 1, win_size, win_size)
+    channels = img1.shape[1]
+    kernel = kernel2d[None, None].expand(channels, 1, win_size, win_size).contiguous()
+
+    # Compute SSIM maps.
+    pad = win_size // 2
+    mu1 = F.conv2d(img1, kernel, padding=pad, groups=channels)
+    mu2 = F.conv2d(img2, kernel, padding=pad, groups=channels)
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, kernel, padding=pad, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, kernel, padding=pad, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, kernel, padding=pad, groups=channels) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return ssim_map.mean()
 
 
 def compute_psnr(
@@ -81,23 +93,14 @@ def compute_psnr(
 ) -> torch.Tensor:
     """Peak Signal-to-Noise Ratio between rendered and GT images.
 
-    Args:
-        rendered: (3, H, W) rendered image.
-        gt:       (3, H, W) ground-truth image.
-        data_range: dynamic range (1.0 for [0,1] images).
-
-    Returns:
-        Scalar PSNR in dB (higher is better).
+    Implemented directly to avoid torchmetrics dependency issues.
     """
-    if rendered.ndim == 3:
-        rendered = rendered.unsqueeze(0)
-        gt = gt.unsqueeze(0)
     gt = gt.to(rendered.device)
-    try:
-        from torchmetrics.functional.image import peak_signal_noise_ratio
-    except ImportError:
-        from torchmetrics.functional import peak_signal_noise_ratio
-    return peak_signal_noise_ratio(rendered, gt, data_range=data_range)
+    mse = F.mse_loss(rendered, gt)
+    if mse < 1e-10:
+        return torch.tensor(100.0, device=rendered.device)
+    psnr = 10.0 * torch.log10(data_range ** 2 / mse)
+    return psnr
 
 
 def sh_dc_to_rgb(sh_dc: torch.Tensor) -> torch.Tensor:

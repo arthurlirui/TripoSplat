@@ -177,157 +177,140 @@ def step1_generate(args):
 def step2_align(args):
     """Align (rotate + scale) initial Gaussians to the scene coordinate system.
 
-    Uses the init-view camera pose from transforms.json to determine the
-    alignment. The key insight: TripoSplat generates Gaussians as if viewed
-    from the init camera. We need to find the transform that places the
-    Gaussians into the real scene coordinate system such that rendering from
-    the init camera pose reproduces the init image.
+    Algorithm:
+      1. Convert TripoSplat model coords → OpenCV via _DEFAULT_TRANSFORM:
+         model→PLY (OpenGL): T_ply = [[1,0,0],[0,0,-1],[0,1,0]]
+         PLY→OpenCV:         T_cv  = diag(1,-1,-1)
+         R_model2cv = T_cv @ T_ply
+      2. Use init camera's c2w rotation as R_align (aligns virtual cam to real cam).
+         Total rotation: R = c2w[:3,:3] @ R_model2cv
+      3. Scene centre = median of all camera positions.
+      4. Search scale via silhouette IoU on init camera.
+      5. Fine-tune yaw/pitch/roll using multi-view IoU.
     """
-    from multiview_refine.cameras import load_cameras, find_camera_by_filename, invert_se3
+    from multiview_refine.cameras import load_cameras, find_camera_by_filename
     from multiview_refine.gaussian_model import _rotation_matrix_to_quaternion, _quaternion_compose
+    from multiview_refine.gsplat_wrapper import render_alpha
+    from multiview_refine.alignment import _euler_to_matrix, _compute_iou_batch
 
     print("=" * 60)
     print("Step 2: Align Gaussians to scene coordinate system")
+    print("  Method: c2w rotation + scale search + multi-view fine-tune")
     print("=" * 60)
 
-    # Load initial Gaussians.
     means, scales_raw, quats, opacities_raw, sh0, shN = load_gaussians_ply(
         args.input_ply, device=args.device)
     print(f"  Loaded {means.shape[0]} Gaussians from {args.input_ply}")
     print(f"  Means range: [{means.min():.3f}, {means.max():.3f}]")
-    print(f"  Centroid: {means.mean(dim=0).tolist()}")
 
-    # Load cameras.
     cameras = load_cameras(args.transforms, device=args.device,
-                           image_scale=1.0, load_image=False)
+                           image_scale=0.25, load_image=True)
     init_cam = find_camera_by_filename(cameras, args.init_view)
-    print(f"\n  Init camera: cam_idx={init_cam.cam_idx}, file={init_cam.file_path}")
-    print(f"  Init camera position: {init_cam.position.tolist()}")
-    print(f"  Init camera c2w (OpenCV):\n{init_cam.c2w.cpu().numpy().round(4)}")
+    print(f"  Init camera: cam_idx={init_cam.cam_idx}, position={init_cam.position.tolist()}")
 
-    # ── Alignment strategy ──
-    # TripoSplat generates Gaussians in a normalized frame where:
-    #   - The camera looks down +Z (OpenCV-like) at the object
-    #   - The object is centered at origin, size ~1 (AABB [-0.5, 0.5])
-    #   - The camera is at roughly [0, 0, D] looking at origin
-    #
-    # The real init camera is at `init_cam.position` looking at the scene.
-    # We need to:
-    #   1. Rotate the Gaussians so their "front" matches the init camera's view
-    #   2. Scale them to match the real scene size
-    #   3. Translate to match the scene centre
-    #
-    # Since TripoSplat uses the convention that the camera is at [0, 0, +Z]
-    # looking at the origin (OpenCV +Z forward), the Gaussians' "front" is
-    # towards -Z. The init camera's "forward" direction is its c2w[:3, 2]
-    # (OpenCV +Z = forward).
+    # Step 1: model → OpenCV rotation
+    T_ply = torch.tensor([[1,0,0],[0,0,-1],[0,1,0]], dtype=torch.float32, device=args.device)
+    T_cv  = torch.tensor([[1,0,0],[0,-1,0],[0,0,-1]], dtype=torch.float32, device=args.device)
+    R_model2cv = T_cv @ T_ply
+    print(f"\n  R_model2cv (model→OpenCV via PLY):")
+    print(f"    {R_model2cv.cpu().numpy().round(4).tolist()}")
 
-    # The init camera's forward direction (where it looks) in world space.
-    cam_forward = init_cam.c2w[:3, 2]  # OpenCV: +Z = forward
-    cam_position = init_cam.c2w[:3, 3]
+    # Step 2: align virtual camera direction to real camera
+    R_align = init_cam.c2w[:3, :3]
+    R = R_align @ R_model2cv
+    print(f"  R = c2w[:3,:3] @ R_model2cv:")
+    print(f"    {R.cpu().numpy().round(4).tolist()}")
 
-    # The object centre in the real scene: we estimate it as a point along
-    # the camera's forward direction, at a reasonable distance.
-    # The distance can be estimated from the camera radius (distance to origin).
-    cam_distance = cam_position.norm().item()
-    scene_centre = cam_position + cam_forward * cam_distance * 0.7  # 70% towards scene
-    print(f"\n  Camera forward: {cam_forward.tolist()}")
-    print(f"  Camera distance from origin: {cam_distance:.3f}")
-    print(f"  Estimated scene centre: {scene_centre.tolist()}")
+    # Step 3: scene centre = median of camera positions
+    positions = torch.stack([c.position for c in cameras])
+    scene_centre = positions.median(0).values
+    print(f"  Scene centre (camera median): {scene_centre.tolist()}")
 
-    # TripoSplat's object is at origin, camera at [0, 0, +D].
-    # In the real scene, the object should be at scene_centre, and the init
-    # camera looks at it from cam_position.
-    #
-    # The rotation R maps TripoSplat's object frame to the scene frame.
-    # TripoSplat camera direction: [0, 0, 1] (looking +Z)
-    # Real camera direction: cam_forward
-    # R should map [0, 0, 1] → cam_forward (approximately)
-    #
-    # But actually, the Gaussians' "viewing direction" in TripoSplat's frame
-    # is from the camera at [0, 0, D] towards the origin, which is [0, 0, -1].
-    # The real camera looks from cam_position towards scene_centre, direction
-    # = (scene_centre - cam_position) = cam_forward * dist * 0.7.
-    # So we need R such that R @ [0, 0, -1] ∝ -cam_forward, i.e., R @ [0, 0, 1] ∝ cam_forward.
+    # Step 4: search scale via init-camera silhouette IoU
+    scales_activated = scales_raw.exp()
+    opacities = torch.sigmoid(opacities_raw)
+    gt_mask = (init_cam.image.mean(0) > 0.05).float()
 
-    # Build R: rotation that maps [0, 0, 1] → cam_forward.
-    z_axis = torch.tensor([0.0, 0.0, 1.0], device=means.device)
-    forward = cam_forward / cam_forward.norm()
-    # Find rotation from z_axis to forward using Rodrigues' formula.
-    cross = torch.cross(z_axis, forward, dim=0)
-    sin_angle = cross.norm()
-    cos_angle = torch.dot(z_axis, forward)
-    if sin_angle < 1e-6:
-        # Already aligned or anti-aligned.
-        if cos_angle > 0:
-            R = torch.eye(3, device=means.device)
-        else:
-            # 180° rotation around any perpendicular axis.
-            R = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]],
-                             dtype=torch.float32, device=means.device)
-    else:
-        # Rodrigues formula.
-        axis = cross / sin_angle
-        K = torch.zeros(3, 3, device=means.device)
-        K[0, 1] = -axis[2]; K[0, 2] = axis[1]
-        K[1, 0] = axis[2]; K[1, 2] = -axis[0]
-        K[2, 0] = -axis[1]; K[2, 1] = axis[0]
-        angle = torch.atan2(sin_angle, cos_angle)
-        R = torch.eye(3, device=means.device) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
+    print(f"\n  Searching scale...")
+    best_iou = -1.0
+    best_scale = 1.0
+    for scale in np.linspace(0.1, 5.0, 50):
+        means_aligned = scale * (means @ R.T) + scene_centre
+        scales_aligned = scales_activated * scale
+        q_R = _rotation_matrix_to_quaternion(R)
+        quats_aligned = _quaternion_compose(q_R, quats)
+        with torch.no_grad():
+            alpha_r = render_alpha(means_aligned, scales_aligned, quats_aligned, opacities, init_cam)
+        r_mask = (alpha_r.squeeze(0) > 0.05).float()
+        inter = (r_mask * gt_mask).sum()
+        union = ((r_mask + gt_mask) > 0).float().sum()
+        iou = (inter / max(union, 1)).item()
+        if iou > best_iou:
+            best_iou = iou
+            best_scale = scale
+    print(f"    Best scale={best_scale:.4f}, init-cam IoU={best_iou:.4f}")
 
-    print(f"\n  Rotation matrix R:\n{R.cpu().numpy().round(4)}")
+    # Step 5: fine-tune rotation using multi-view IoU
+    print(f"\n  Fine-tuning rotation (multi-view IoU)...")
+    subset_cams = [cameras[i] for i in range(0, len(cameras), 4)]
+    subset_masks = [(cameras[i].image.mean(0) > 0.05).float() for i in range(0, len(cameras), 4)]
 
-    # Scale: TripoSplat object size ~1, real scene size estimated from camera distance.
-    # The object should occupy a reasonable portion of the camera's view.
-    # Scale = scene_radius / tripo_object_radius
-    tripo_radius = float(means.std(dim=0).norm().item() * 2)  # ~2σ
-    scene_radius = cam_distance * 0.3  # rough: object is 30% of camera distance
-    scale = scene_radius / max(tripo_radius, 1e-6)
-    print(f"  Tripo object radius: {tripo_radius:.4f}")
-    print(f"  Estimated scene radius: {scene_radius:.4f}")
-    print(f"  Scale: {scale:.4f}")
+    best_iou_fine = best_iou
+    best_R_fine = R.clone()
+    best_scale_fine = best_scale
 
-    # Translation: place the rotated+scaled centroid at the scene centre.
-    centroid_tripo = means.mean(dim=0)
-    t = scene_centre - scale * (R @ centroid_tripo)
-    print(f"  Translation: {t.tolist()}")
+    for scale in np.linspace(max(best_scale * 0.5, 0.1), best_scale * 2, 10):
+        for yaw in np.linspace(-0.5, 0.5, 7):
+            for pitch in np.linspace(-0.5, 0.5, 7):
+                for roll in np.linspace(-0.2, 0.2, 5):
+                    R_fine = _euler_to_matrix(pitch, yaw, roll).to(args.device) @ R
+                    means_aligned = scale * (means @ R_fine.T) + scene_centre
+                    scales_aligned = scales_activated * scale
+                    q_fine = _rotation_matrix_to_quaternion(R_fine)
+                    quats_aligned = _quaternion_compose(q_fine, quats)
+                    sils = []
+                    for cam in subset_cams:
+                        with torch.no_grad():
+                            alpha_r = render_alpha(means_aligned, scales_aligned, quats_aligned, opacities, cam)
+                        sils.append((alpha_r.squeeze(0) > 0.05).float())
+                    iou = _compute_iou_batch(sils, subset_masks)
+                    if iou > best_iou_fine:
+                        best_iou_fine = iou
+                        best_R_fine = R_fine.clone()
+                        best_scale_fine = scale
+                        print(f"    scale={scale:.2f} yaw={np.degrees(yaw):.0f}° pitch={np.degrees(pitch):.0f}° roll={np.degrees(roll):.0f}° IoU={iou:.4f} ★")
 
-    # Apply the transform.
-    means_aligned = scale * (means @ R.T) + t
-    scales_aligned_raw = scales_raw + math.log(scale)  # add log(scale) to log-scales
+    # Apply final transform
+    R = best_R_fine
+    scale = best_scale_fine
+    means_aligned = scale * (means @ R.T) + scene_centre
+    scales_aligned_raw = scales_raw + math.log(scale)
     q_R = _rotation_matrix_to_quaternion(R)
     quats_aligned = _quaternion_compose(q_R, quats)
-    print(f"\n  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
-    print(f"  Aligned centroid: {means_aligned.mean(dim=0).tolist()}")
 
-    # Verify: transform the init camera position to camera space and check
-    # that the aligned centroid is in front of the camera (z > 0).
-    centroid_cam = init_cam.w2c[:3, :3] @ means_aligned.mean(dim=0) + init_cam.w2c[:3, 3]
-    print(f"\n  Verification:")
-    print(f"    Aligned centroid in init camera space: {centroid_cam.tolist()}")
-    print(f"    z = {centroid_cam[2].item():.4f} (must be > 0 for OpenCV/gsplat)")
+    print(f"\n  Final: scale={scale:.4f}, multi-view IoU={best_iou_fine:.4f}")
+    print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
 
-    # Save aligned Gaussians.
+    # Save
     os.makedirs(args.output_dir, exist_ok=True)
     ply_path = os.path.join(args.output_dir, "aligned_gaussians.ply")
     save_gaussians_ply(ply_path, means_aligned, scales_aligned_raw, quats_aligned,
                        opacities_raw, sh0, shN)
 
-    # Save alignment parameters for reference.
     import json
     params = {
-        'scale': float(scale),
-        'rotation': R.cpu().numpy().tolist(),
-        'translation': t.cpu().numpy().tolist(),
+        'scale': float(scale), 'rotation': R.cpu().numpy().tolist(),
+        'translation': (scene_centre - scale * (R @ means.mean(0))).cpu().numpy().tolist(),
         'scene_centre': scene_centre.cpu().numpy().tolist(),
-        'init_camera_position': cam_position.cpu().numpy().tolist(),
+        'R_model2cv': R_model2cv.cpu().numpy().tolist(),
+        'R_align': R_align.cpu().numpy().tolist(),
+        'best_iou': float(best_iou_fine),
+        'method': 'c2w_rotation + scale_search + multiview_finetune',
     }
-    params_path = os.path.join(args.output_dir, "alignment_params.json")
-    with open(params_path, 'w') as f:
+    with open(os.path.join(args.output_dir, "alignment_params.json"), 'w') as f:
         json.dump(params, f, indent=2)
-    print(f"\n  Alignment params saved to {params_path}")
-
-    print(f"\nStep 2 complete. Aligned Gaussians saved to {ply_path}")
+    print(f"\n  Saved {ply_path}")
+    print(f"Step 2 complete. IoU = {best_iou_fine:.4f}")
 
 
 # ── Step 3: Render from all training poses ────────────────────────────────
