@@ -221,3 +221,18 @@ __marimo__/
 *.ply
 *.splat
 /static
+
+# Multi-view refinement outputs
+/refine_output/
+/scratch_output/
+/demo_output/
+/pipeline_output/
+/skinned_demo/
+/synthetic_demo/
+
+# Large media files
+*.mp4
+*.gif
+
+# ZCode session files
+/.zcode/
