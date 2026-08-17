@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .skinning import lbs_deform_gaussians, _quaternion_compose_batch, _rotation_matrix_to_quaternion_batch
+from .skinning import lbs_deform_gaussians
+from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
 
 SH_C0 = 0.28209479177387814
 
@@ -33,19 +34,28 @@ class SkinnedGaussians(nn.Module):
       _skin_weights:  (N, K)  raw skinning weights (softmax-normalized on use).
     """
 
-    def __init__(self, n_joints: int = 24, sh_degree: int = 0, device: str = 'cuda'):
+    def __init__(self, n_joints: int = 24, sh_degree: int = 0, device: str = 'cuda',
+                 n_expression: int = 0):
         super().__init__()
         self.n_joints = n_joints
         self.sh_degree = sh_degree
+        self.n_expression = n_expression  # number of expression blendshape bases
         self.device = torch.device(device)
 
-        # Parameters (allocated in from_static / from_ply).
+        # Parameters (allocated in from_attributes / from_ply).
         self._means: nn.Parameter | None = None
         self._scales: nn.Parameter | None = None
         self._quats: nn.Parameter | None = None
         self._opacities: nn.Parameter | None = None
         self._sh0: nn.Parameter | None = None
         self._skin_weights: nn.Parameter | None = None
+        # Expression blendshape basis: (N, n_expression, 3)
+        # Means deformation: Δμ = Σ α_i * basis_i
+        self._expr_basis: nn.Parameter | None = None
+        # Whether skin weights are optimizable (requires_grad=True for joint optimization).
+        self._weights_optimizable = False
+        # Reference weights for regularization (fixed, from SMPL).
+        self._weights_ref: torch.Tensor | None = None
 
     # ── Properties ────────────────────────────────────────────────────
 
@@ -96,9 +106,21 @@ class SkinnedGaussians(nn.Module):
         n_joints: int = 24,
         sh_degree: int = 0,
         device: str = 'cuda',
+        expr_basis: torch.Tensor | None = None,  # (N, n_expr, 3) expression displacement bases
+        weights_optimizable: bool = False,         # if True, skin weights can be fine-tuned
     ) -> "SkinnedGaussians":
-        """Create from explicit attribute tensors."""
-        model = cls(n_joints=n_joints, sh_degree=sh_degree, device=device)
+        """Create from explicit attribute tensors.
+
+        Args:
+            expr_basis: (N, n_expression, 3) per-Gaussian expression displacement bases.
+                When provided, expression coefficients α can deform means:
+                μ_posed = μ_canonical + Σ α_i * expr_basis_i
+            weights_optimizable: if True, skin weights are trainable and a
+                regularization loss against the initial SMPL weights is used.
+        """
+        n_expr = expr_basis.shape[1] if expr_basis is not None else 0
+        model = cls(n_joints=n_joints, sh_degree=sh_degree, device=device,
+                     n_expression=n_expr)
         model._means = nn.Parameter(means.float().to(device))
         model._scales = nn.Parameter(scales_raw.float().to(device))
         model._quats = nn.Parameter(quats.float().to(device))
@@ -107,23 +129,43 @@ class SkinnedGaussians(nn.Module):
         # Store skin weights as logits (so softmax gives normalized weights).
         weights_norm = skin_weights.float().to(device)
         weights_norm = weights_norm / weights_norm.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        # log(w) as raw parameter → softmax(log(w)) = w (approximately).
         model._skin_weights = nn.Parameter(torch.log(weights_norm.clamp_min(1e-8)))
+        # Expression basis (fixed, not optimized in MVP).
+        if expr_basis is not None:
+            model._expr_basis = nn.Parameter(expr_basis.float().to(device),
+                                              requires_grad=False)
+        # Weight optimization setup.
+        model._weights_optimizable = weights_optimizable
+        if weights_optimizable:
+            # Store reference weights for regularization (detached copy).
+            model._weights_ref = model.skin_weights.detach().clone()
         return model
 
     # ── Deformation ───────────────────────────────────────────────────
 
-    def deform(self, joint_transforms: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Deform canonical Gaussians to posed space via LBS.
+    def deform(self, joint_transforms: torch.Tensor,
+               expression: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Deform canonical Gaussians to posed space via LBS + expression.
 
         Args:
-            joint_transforms: (K, 4, 4) per-joint world transforms.
+            joint_transforms: (K, 4, 4) per-joint relative transforms.
+            expression: (n_expression,) expression coefficients. If provided
+                and _expr_basis exists, adds expression displacement to means.
 
         Returns:
             means_p (N, 3), scales_p (N, 3 activated), quats_p (N, 4 normalized).
         """
+        # Start with canonical means.
+        means_c = self.means
+
+        # Apply expression blendshape displacement (if available).
+        if expression is not None and self._expr_basis is not None and self._expr_basis.numel() > 0:
+            # Δμ = Σ α_i * basis_i  →  (N, 3)
+            expr_disp = torch.einsum('nei,e->ni', self._expr_basis, expression)
+            means_c = means_c + expr_disp
+
         return lbs_deform_gaussians(
-            self.means,
+            means_c,
             self.scales,        # activated
             self.raw_quats,     # raw (will be normalized in deform)
             self.skin_weights,  # softmax-normalized
@@ -140,19 +182,48 @@ class SkinnedGaussians(nn.Module):
         camera,
         background: Optional[torch.Tensor] = None,
         sh_degree: int = 0,
+        expression: torch.Tensor | None = None,
     ):
         """Deform + render in one call.
+
+        Args:
+            expression: (n_expression,) expression coefficients for facial animation.
 
         Returns (rgb, alpha, meta) from gsplat.
         """
         from multiview_refine.gsplat_wrapper import render_gaussians
 
-        means_p, scales_p, quats_p = self.deform(joint_transforms)
+        means_p, scales_p, quats_p = self.deform(joint_transforms, expression)
         return render_gaussians(
             means_p, scales_p, quats_p,
             self.get_colors(), self.opacities,
             camera, background=background, sh_degree=sh_degree,
         )
+
+    def weight_regularization_loss(self, lambda_reg: float = 0.01) -> torch.Tensor:
+        """L2 regularization on skin weights deviation from SMPL prior.
+
+        Encourages optimized weights to stay close to the initial SMPL-inherited
+        weights. Only effective when _weights_optimizable=True.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        if not self._weights_optimizable or self._weights_ref is None:
+            return torch.tensor(0.0, device=self.device)
+        w = self.skin_weights  # (N, K) softmax-normalized, differentiable
+        return lambda_reg * ((w - self._weights_ref) ** 2).mean()
+
+    def training_setup_weights(self, lr: float = 1e-3):
+        """Add skin weights to the optimizer for joint weight optimization.
+
+        Call this after training_setup() if _weights_optimizable=True.
+        """
+        if self._weights_optimizable and self._skin_weights is not None:
+            # Add skin weights to a separate optimizer group.
+            self.optimizers['skin_weights'] = torch.optim.Adam(
+                [{'params': [self._skin_weights], 'lr': lr, 'name': 'skin_weights'}],
+                eps=1e-15)
 
     # ── Export ────────────────────────────────────────────────────────
 

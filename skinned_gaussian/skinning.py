@@ -19,6 +19,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
+
 # SH degree-0 constant (for colour conversion).
 SH_C0 = 0.28209479177387814
 
@@ -70,9 +72,9 @@ def lbs_deform_gaussians(
 
     # ── 4. Rotation deformation ──
     # q^p = q(R̃) ⊗ q^c  (compose blended rotation with canonical rotation)
-    q_R = _rotation_matrix_to_quaternion_batch(R_tilde)  # (N, 4)
+    q_R = rotation_matrix_to_quaternion(R_tilde)  # (N, 4)
     q_c = F.normalize(quats_c, dim=-1)  # (N, 4)
-    quats_p = _quaternion_compose_batch(q_R, q_c)  # (N, 4)
+    quats_p = quaternion_compose(q_R, q_c)  # (N, 4)
 
     # ── 5. Scale deformation ──
     # Take the diagonal of S̃ as the anisotropic scale factor,
@@ -121,85 +123,3 @@ def _polar_decompose(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     S = 0.5 * (S + S.transpose(-2, -1))
 
     return R, S
-
-
-def _rotation_matrix_to_quaternion_batch(R: torch.Tensor) -> torch.Tensor:
-    """Convert (N, 3, 3) rotation matrices to (N, 4) quaternions (w, x, y, z).
-
-    Uses the Shepperd method for numerical stability.
-    """
-    N = R.shape[0]
-    device = R.device
-
-    # Extract elements.
-    r00 = R[:, 0, 0]
-    r01 = R[:, 0, 1]
-    r02 = R[:, 0, 2]
-    r10 = R[:, 1, 0]
-    r11 = R[:, 1, 1]
-    r12 = R[:, 1, 2]
-    r20 = R[:, 2, 0]
-    r21 = R[:, 2, 1]
-    r22 = R[:, 2, 2]
-
-    trace = r00 + r11 + r22  # (N,)
-
-    # Branch 1: trace > 0
-    q = torch.zeros(N, 4, device=device)
-    mask1 = trace > 0
-    if mask1.any():
-        S = torch.sqrt(trace[mask1] + 1.0) * 2.0  # 4w
-        q[mask1, 0] = 0.25 * S
-        q[mask1, 1] = (r21[mask1] - r12[mask1]) / S
-        q[mask1, 2] = (r02[mask1] - r20[mask1]) / S
-        q[mask1, 3] = (r10[mask1] - r01[mask1]) / S
-
-    # Branch 2: r00 is the largest diagonal
-    mask2 = (~mask1) & (r00 >= r11) & (r00 >= r22)
-    if mask2.any():
-        S = torch.sqrt(1.0 + r00[mask2] - r11[mask2] - r22[mask2]) * 2.0  # 4x
-        q[mask2, 0] = (r21[mask2] - r12[mask2]) / S
-        q[mask2, 1] = 0.25 * S
-        q[mask2, 2] = (r01[mask2] + r10[mask2]) / S
-        q[mask2, 3] = (r02[mask2] + r20[mask2]) / S
-
-    # Branch 3: r11 is the largest diagonal
-    mask3 = (~mask1) & (~mask2) & (r11 >= r22)
-    if mask3.any():
-        S = torch.sqrt(1.0 + r11[mask3] - r00[mask3] - r22[mask3]) * 2.0  # 4y
-        q[mask3, 0] = (r02[mask3] - r20[mask3]) / S
-        q[mask3, 1] = (r01[mask3] + r10[mask3]) / S
-        q[mask3, 2] = 0.25 * S
-        q[mask3, 3] = (r12[mask3] + r21[mask3]) / S
-
-    # Branch 4: r22 is the largest diagonal
-    mask4 = (~mask1) & (~mask2) & (~mask3)
-    if mask4.any():
-        S = torch.sqrt(1.0 + r22[mask4] - r00[mask4] - r11[mask4]) * 2.0  # 4z
-        q[mask4, 0] = (r10[mask4] - r01[mask4]) / S
-        q[mask4, 1] = (r02[mask4] + r20[mask4]) / S
-        q[mask4, 2] = (r12[mask4] + r21[mask4]) / S
-        q[mask4, 3] = 0.25 * S
-
-    return F.normalize(q, dim=-1)
-
-
-def _quaternion_compose_batch(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """Batch Hamilton product q1 ⊗ q2.
-
-    Args:
-        q1: (N, 4) quaternion (w, x, y, z).
-        q2: (N, 4) quaternion (w, x, y, z).
-
-    Returns:
-        (N, 4) composed quaternion q1 ⊗ q2.
-    """
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
-
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-
-    return torch.stack([w, x, y, z], dim=-1)

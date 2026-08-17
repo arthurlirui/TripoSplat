@@ -17,6 +17,14 @@ from .gaussian_model import RefineableGaussians
 from .losses import compute_loss, compute_psnr, ssim, sh_dc_to_rgb, rgb_to_sh_dc
 from .alignment import estimate_similarity_transform
 from .refine import refine_from_multiview
+from .quaternion import (
+    quat_to_matrix,
+    matrix_to_quat,
+    quaternion_compose,
+    rotation_matrix_to_quaternion,
+)
+from .ply_io import load_gaussians_ply, save_gaussians_ply
+from .video_io import create_video_writer
 
 __all__ = [
     "Camera",
@@ -36,4 +44,11 @@ __all__ = [
     "rgb_to_sh_dc",
     "estimate_similarity_transform",
     "refine_from_multiview",
+    "quat_to_matrix",
+    "matrix_to_quat",
+    "quaternion_compose",
+    "rotation_matrix_to_quaternion",
+    "load_gaussians_ply",
+    "save_gaussians_ply",
+    "create_video_writer",
 ]

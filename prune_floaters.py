@@ -30,9 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from multiview_refine.cameras import load_cameras
 from multiview_refine.gsplat_wrapper import render_gaussians
-from render_turntable import load_ply_to_gaussians, SH_C0
-from run_pipeline import save_gaussians_ply
-from multiview_refine.gaussian_model import _rotation_matrix_to_quaternion, _quaternion_compose
+from multiview_refine.ply_io import load_gaussians_ply, save_gaussians_ply
+from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
 
 
 def prune_floaters(
@@ -172,7 +171,7 @@ def main():
     print("=" * 60)
 
     device = torch.device(args.device)
-    means, scales_raw, quats, opacities_raw, sh0, shN = load_ply_to_gaussians(
+    means, scales_raw, quats, opacities_raw, sh0, shN = load_gaussians_ply(
         args.input_ply, device)
     print(f"  Loaded {len(means)} Gaussians from {args.input_ply}")
 

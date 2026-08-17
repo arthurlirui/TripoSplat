@@ -69,8 +69,8 @@ def main():
     print("=" * 60)
     print("Step 1: Load static Gaussians")
     print("=" * 60)
-    from skinned_gaussian.rigging import load_static_gaussians
-    means, scales_raw, quats, opacities_raw, sh0 = load_static_gaussians(
+    from multiview_refine.ply_io import load_gaussians_ply
+    means, scales_raw, quats, opacities_raw, sh0, _ = load_gaussians_ply(
         args.gaussians, device=args.device)
     print(f"  Loaded {len(means)} Gaussians from {args.gaussians}")
     print(f"  Means range: [{means.min():.3f}, {means.max():.3f}]")
@@ -109,8 +109,8 @@ def main():
     print(f"  SMPL scale to fit: {smpl_scale:.3f}")
 
     # Scale and translate SMPL rest mesh to match Gaussian cloud.
-    # This permanently aligns SMPL so joint transforms are in Gaussian space.
-    smpl.align_to_scene(scale=smpl_scale, transl=gc)
+    # Returns a new aligned instance; the original smpl is unchanged.
+    smpl = smpl.align_to_scene(scale=smpl_scale, transl=gc)
 
     skinned = rig_gaussians_to_smpl(
         means, scales_raw, quats, opacities_raw, sh0,

@@ -27,6 +27,8 @@ import torch.nn.functional as F
 import gsplat
 from gsplat.strategy import DefaultStrategy
 
+from .quaternion import quaternion_compose, rotation_matrix_to_quaternion
+
 # SH degree-0 constant for colour conversion.
 SH_C0 = 0.28209479177387814
 
@@ -175,8 +177,8 @@ class RefineableGaussians(nn.Module):
         rots_bias = g.rots_bias.to(device).float()  # (1, 4) = [1, 0, 0, 0]
         quats_activated = raw_quats + rots_bias[None, :]  # (N, 4)
         # Convert R to quaternion
-        q_R = _rotation_matrix_to_quaternion(R)  # (4,)
-        quats_new = _quaternion_compose(q_R, quats_activated)  # (N, 4)
+        q_R = rotation_matrix_to_quaternion(R)  # (4,)
+        quats_new = quaternion_compose(q_R, quats_activated)  # (N, 4)
         # Store raw (gsplat normalises internally, so we can store the
         # activated quaternion directly as "raw"; normalisation happens in
         # the quats property).
@@ -422,8 +424,6 @@ class RefineableGaussians(nn.Module):
     @torch.no_grad()
     def save_splat(self, path: str):
         """Save to a .splat file (32 bytes per splat) for web viewers."""
-        import struct as _struct
-
         means = self._means.detach().cpu().numpy()
         scales = self._scales.exp().detach().cpu().numpy()
         opacities = torch.sigmoid(self._opacities).detach().cpu().numpy()
@@ -455,66 +455,3 @@ class RefineableGaussians(nn.Module):
                 f.write(scales[i].astype(np.float32).tobytes())  # 12B scale
                 f.write(rgba[i].tobytes())  # 4B rgba
                 f.write(quats_u8[i].tobytes())  # 4B rot
-
-
-# ── Quaternion utilities ────────────────────────────────────────────────
-
-def _rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
-    """Convert a 3x3 rotation matrix to a quaternion (w, x, y, z)."""
-    R = R.detach().cpu()
-    trace = float(R[0, 0] + R[1, 1] + R[2, 2])
-    if trace > 0:
-        S = math.sqrt(trace + 1.0) * 2.0
-        w = 0.25 * S
-        x = float(R[2, 1] - R[1, 2]) / S
-        y = float(R[0, 2] - R[2, 0]) / S
-        z = float(R[1, 0] - R[0, 1]) / S
-    elif float(R[0, 0]) > float(R[1, 1]) and float(R[0, 0]) > float(R[2, 2]):
-        S = math.sqrt(1.0 + float(R[0, 0]) - float(R[1, 1]) - float(R[2, 2])) * 2.0
-        w = float(R[2, 1] - R[1, 2]) / S
-        x = 0.25 * S
-        y = float(R[0, 1] + R[1, 0]) / S
-        z = float(R[0, 2] + R[2, 0]) / S
-    elif float(R[1, 1]) > float(R[2, 2]):
-        S = math.sqrt(1.0 + float(R[1, 1]) - float(R[0, 0]) - float(R[2, 2])) * 2.0
-        w = float(R[0, 2] - R[2, 0]) / S
-        x = float(R[0, 1] + R[1, 0]) / S
-        y = 0.25 * S
-        z = float(R[1, 2] + R[2, 1]) / S
-    else:
-        S = math.sqrt(1.0 + float(R[2, 2]) - float(R[0, 0]) - float(R[1, 1])) * 2.0
-        w = float(R[1, 0] - R[0, 1]) / S
-        x = float(R[0, 2] + R[2, 0]) / S
-        y = float(R[1, 2] + R[2, 1]) / S
-        z = 0.25 * S
-    q = torch.tensor([w, x, y, z], dtype=torch.float32)
-    return q / q.norm()
-
-
-def _quaternion_compose(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """Compose quaternions: result = q1 * q2 (Hamilton product).
-
-    Args:
-        q1: (4,) quaternion (w, x, y, z).
-        q2: (N, 4) or (4,) quaternion(s).
-
-    Returns:
-        (N, 4) or (4,) composed quaternion(s).
-    """
-    w1, x1, y1, z1 = q1.unbind(-1)
-    if q2.ndim == 1:
-        q2 = q2.unsqueeze(0)
-        squeeze = True
-    else:
-        squeeze = False
-    w2, x2, y2, z2 = q2.unbind(-1)
-
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-
-    result = torch.stack([w, x, y, z], dim=-1)
-    if squeeze:
-        result = result.squeeze(0)
-    return result

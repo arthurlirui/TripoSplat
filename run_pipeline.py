@@ -28,6 +28,7 @@ import argparse
 import os
 import sys
 import math
+import json
 
 import numpy as np
 import torch
@@ -35,88 +36,10 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from multiview_refine.ply_io import load_gaussians_ply, save_gaussians_ply
+from multiview_refine.video_io import create_video_writer
+
 SH_C0 = 0.28209479177387814
-
-
-# ── PLY I/O ────────────────────────────────────────────────────────────────
-
-def save_gaussians_ply(path, means, scales_raw, quats, opacities_raw, sh0, shN=None):
-    """Save Gaussians to a 3DGS-compatible PLY (raw/pre-activation values)."""
-    import struct
-    from plyfile import PlyData, PlyElement
-
-    N = means.shape[0]
-    means_np = means.cpu().numpy()
-    sh0_np = sh0.cpu().numpy()  # (N, 1, 3)
-    f_dc = sh0_np.transpose(0, 2, 1).reshape(N, -1)  # (N, 3)
-
-    if shN is not None and shN.numel() > 0:
-        shN_np = shN.cpu().numpy()
-        f_rest = shN_np.transpose(0, 2, 1).reshape(N, -1)
-    else:
-        f_rest = np.zeros((N, 0), dtype=np.float32)
-
-    normals = np.zeros_like(means_np)
-    opacities_np = opacities_raw.cpu().numpy().reshape(-1, 1)
-    scales_np = scales_raw.cpu().numpy()
-    rotations_np = torch.nn.functional.normalize(quats, dim=-1).cpu().numpy()
-
-    data = np.concatenate([means_np, normals, f_dc, f_rest, opacities_np, scales_np, rotations_np], axis=1)
-
-    names = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-    for i in range(f_dc.shape[1]):
-        names.append(f'f_dc_{i}')
-    for i in range(f_rest.shape[1]):
-        names.append(f'f_rest_{i}')
-    names.append('opacity')
-    for i in range(3):
-        names.append(f'scale_{i}')
-    for i in range(4):
-        names.append(f'rot_{i}')
-
-    dtype = [(n, 'f4') for n in names]
-    elements = np.empty(N, dtype=dtype)
-    elements[:] = list(map(tuple, data))
-
-    el = PlyElement.describe(elements, 'vertex')
-    PlyData([el], byte_order='<', text=False).write(path)
-    print(f"  Saved {N} Gaussians to {path}")
-
-
-def load_gaussians_ply(path, device='cuda'):
-    """Load Gaussians from PLY. Returns (means, scales_raw, quats, opacities_raw, sh0, shN)."""
-    from plyfile import PlyData
-    plydata = PlyData.read(path)
-    v = plydata['vertex']
-    data = np.stack([v[name] for name in v.data.dtype.names], axis=1)
-    names = list(v.data.dtype.names)
-
-    def col(name):
-        return data[:, names.index(name)]
-
-    means = np.stack([col('x'), col('y'), col('z')], axis=-1)
-    f_dc = np.stack([col('f_dc_0'), col('f_dc_1'), col('f_dc_2')], axis=-1)
-    sh0 = f_dc[:, None, :]
-    f_rest_names = sorted([n for n in names if n.startswith('f_rest_')])
-    if f_rest_names:
-        f_rest = np.stack([col(n) for n in f_rest_names], axis=-1)
-        shN = f_rest.reshape(-1, len(f_rest_names) // 3, 3)
-    else:
-        shN = np.zeros((means.shape[0], 0, 3), dtype=np.float32)
-
-    opacities = col('opacity')
-    scales = np.stack([col('scale_0'), col('scale_1'), col('scale_2')], axis=-1)
-    quats = np.stack([col('rot_0'), col('rot_1'), col('rot_2'), col('rot_3')], axis=-1)
-
-    dev = torch.device(device)
-    return (
-        torch.from_numpy(means).float().to(dev),
-        torch.from_numpy(scales).float().to(dev),
-        torch.from_numpy(quats).float().to(dev),
-        torch.from_numpy(opacities).float().to(dev),
-        torch.from_numpy(sh0).float().to(dev),
-        torch.from_numpy(shN).float().to(dev),
-    )
 
 
 # ── Step 1: Generate initial Gaussians ────────────────────────────────────
@@ -177,25 +100,17 @@ def step1_generate(args):
 def step2_align(args):
     """Align (rotate + scale) initial Gaussians to the scene coordinate system.
 
-    Algorithm:
-      1. Convert TripoSplat model coords → OpenCV via _DEFAULT_TRANSFORM:
-         model→PLY (OpenGL): T_ply = [[1,0,0],[0,0,-1],[0,1,0]]
-         PLY→OpenCV:         T_cv  = diag(1,-1,-1)
-         R_model2cv = T_cv @ T_ply
-      2. Use init camera's c2w rotation as R_align (aligns virtual cam to real cam).
-         Total rotation: R = c2w[:3,:3] @ R_model2cv
-      3. Scene centre = median of all camera positions.
-      4. Search scale via silhouette IoU on init camera.
-      5. Fine-tune yaw/pitch/roll using multi-view IoU.
+    Uses the shared ``estimate_similarity_transform_multiview`` from the
+    alignment module, initialised with the yaw of the init camera's c2w
+    rotation for a faster and more targeted search.
     """
     from multiview_refine.cameras import load_cameras, find_camera_by_filename
-    from multiview_refine.gaussian_model import _rotation_matrix_to_quaternion, _quaternion_compose
-    from multiview_refine.gsplat_wrapper import render_alpha
-    from multiview_refine.alignment import _euler_to_matrix, _compute_iou_batch
+    from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
+    from multiview_refine.alignment import estimate_similarity_transform_multiview
 
     print("=" * 60)
     print("Step 2: Align Gaussians to scene coordinate system")
-    print("  Method: c2w rotation + scale search + multi-view fine-tune")
+    print("  Method: multiview_alignment_module")
     print("=" * 60)
 
     means, scales_raw, quats, opacities_raw, sh0, shN = load_gaussians_ply(
@@ -208,85 +123,51 @@ def step2_align(args):
     init_cam = find_camera_by_filename(cameras, args.init_view)
     print(f"  Init camera: cam_idx={init_cam.cam_idx}, position={init_cam.position.tolist()}")
 
-    # Step 1: model → OpenCV rotation
-    T_ply = torch.tensor([[1,0,0],[0,0,-1],[0,1,0]], dtype=torch.float32, device=args.device)
-    T_cv  = torch.tensor([[1,0,0],[0,-1,0],[0,0,-1]], dtype=torch.float32, device=args.device)
+    # ── Pre-transform: apply model→OpenCV rotation ──
+    # The PLY stores Gaussians in model space (Z-up). We rotate to OpenCV
+    # (Y-down, +X right, +Z forward) so the alignment module's coordinate
+    # conventions match the camera poses.
+    T_ply = torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]],
+                         dtype=torch.float32, device=args.device)
+    T_cv = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]],
+                        dtype=torch.float32, device=args.device)
     R_model2cv = T_cv @ T_ply
-    print(f"\n  R_model2cv (model→OpenCV via PLY):")
-    print(f"    {R_model2cv.cpu().numpy().round(4).tolist()}")
 
-    # Step 2: align virtual camera direction to real camera
-    R_align = init_cam.c2w[:3, :3]
-    R = R_align @ R_model2cv
-    print(f"  R = c2w[:3,:3] @ R_model2cv:")
-    print(f"    {R.cpu().numpy().round(4).tolist()}")
+    means_cv = means @ R_model2cv.T  # rotate means to OpenCV convention
+    quats_cv = quaternion_compose(rotation_matrix_to_quaternion(R_model2cv), quats)
 
-    # Step 3: scene centre = median of camera positions
-    positions = torch.stack([c.position for c in cameras])
-    scene_centre = positions.median(0).values
-    print(f"  Scene centre (camera median): {scene_centre.tolist()}")
+    # ── Extract init_yaw from the init camera's c2w rotation ──
+    forward = init_cam.c2w[:3, 2]
+    init_yaw = math.atan2(float(forward[0]), float(forward[2]))
 
-    # Step 4: search scale via init-camera silhouette IoU
+    print(f"\n  R_model2cv applied to means")
+    print(f"  init_yaw = {math.degrees(init_yaw):.1f}° (from c2w forward)")
+
+    # ── Delegate to the shared alignment module ──
     scales_activated = scales_raw.exp()
     opacities = torch.sigmoid(opacities_raw)
-    gt_mask = (init_cam.image.mean(0) > 0.05).float()
+    colors = sh0  # (N, 1, 3) SH DC
 
-    print(f"\n  Searching scale...")
-    best_iou = -1.0
-    best_scale = 1.0
-    for scale in np.linspace(0.1, 5.0, 50):
-        means_aligned = scale * (means @ R.T) + scene_centre
-        scales_aligned = scales_activated * scale
-        q_R = _rotation_matrix_to_quaternion(R)
-        quats_aligned = _quaternion_compose(q_R, quats)
-        with torch.no_grad():
-            alpha_r = render_alpha(means_aligned, scales_aligned, quats_aligned, opacities, init_cam)
-        r_mask = (alpha_r.squeeze(0) > 0.05).float()
-        inter = (r_mask * gt_mask).sum()
-        union = ((r_mask + gt_mask) > 0).float().sum()
-        iou = (inter / max(union, 1)).item()
-        if iou > best_iou:
-            best_iou = iou
-            best_scale = scale
-    print(f"    Best scale={best_scale:.4f}, init-cam IoU={best_iou:.4f}")
+    scale, R, t = estimate_similarity_transform_multiview(
+        tensors=(means_cv, scales_activated, quats_cv, opacities, colors),
+        cameras=cameras,
+        init_yaw=init_yaw,
+        alpha_threshold=0.1,
+        verbose=True,
+    )
 
-    # Step 5: fine-tune rotation using multi-view IoU
-    print(f"\n  Fine-tuning rotation (multi-view IoU)...")
-    subset_cams = [cameras[i] for i in range(0, len(cameras), 4)]
-    subset_masks = [(cameras[i].image.mean(0) > 0.05).float() for i in range(0, len(cameras), 4)]
-
-    best_iou_fine = best_iou
-    best_R_fine = R.clone()
-    best_scale_fine = best_scale
-
-    for scale in np.linspace(max(best_scale * 0.5, 0.1), best_scale * 2, 10):
-        for yaw in np.linspace(-0.5, 0.5, 7):
-            for pitch in np.linspace(-0.5, 0.5, 7):
-                for roll in np.linspace(-0.2, 0.2, 5):
-                    R_fine = _euler_to_matrix(pitch, yaw, roll).to(args.device) @ R
-                    means_aligned = scale * (means @ R_fine.T) + scene_centre
-                    scales_aligned = scales_activated * scale
-                    q_fine = _rotation_matrix_to_quaternion(R_fine)
-                    quats_aligned = _quaternion_compose(q_fine, quats)
-                    sils = []
-                    for cam in subset_cams:
-                        with torch.no_grad():
-                            alpha_r = render_alpha(means_aligned, scales_aligned, quats_aligned, opacities, cam)
-                        sils.append((alpha_r.squeeze(0) > 0.05).float())
-                    iou = _compute_iou_batch(sils, subset_masks)
-                    if iou > best_iou_fine:
-                        best_iou_fine = iou
-                        best_R_fine = R_fine.clone()
-                        best_scale_fine = scale
-                        print(f"    scale={scale:.2f} yaw={np.degrees(yaw):.0f}° pitch={np.degrees(pitch):.0f}° roll={np.degrees(roll):.0f}° IoU={iou:.4f} ★")
-
-    # Apply final transform
-    R = best_R_fine
-    scale = best_scale_fine
-    means_aligned = scale * (means @ R.T) + scene_centre
+    # ── Apply final transform ──
+    # The alignment module returns transform relative to the OpenCV-space
+    # means.  Total: xyz_scene = scale * (R @ means_cv) + t
+    # which is equivalent to: scale * (R @ R_model2cv @ means_orig) + t
+    means_aligned = scale * (means_cv @ R.T) + t
     scales_aligned_raw = scales_raw + math.log(scale)
-    q_R = _rotation_matrix_to_quaternion(R)
-    quats_aligned = _quaternion_compose(q_R, quats)
+    R_total = R @ R_model2cv  # model → scene
+    q_total = rotation_matrix_to_quaternion(R_total)
+    quats_aligned = quaternion_compose(q_total, quats)
+
+    print(f"\n  Final: scale={scale:.4f}")
+    print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
 
     print(f"\n  Final: scale={scale:.4f}, multi-view IoU={best_iou_fine:.4f}")
     print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
@@ -297,20 +178,17 @@ def step2_align(args):
     save_gaussians_ply(ply_path, means_aligned, scales_aligned_raw, quats_aligned,
                        opacities_raw, sh0, shN)
 
-    import json
     params = {
-        'scale': float(scale), 'rotation': R.cpu().numpy().tolist(),
-        'translation': (scene_centre - scale * (R @ means.mean(0))).cpu().numpy().tolist(),
-        'scene_centre': scene_centre.cpu().numpy().tolist(),
+        'scale': float(scale), 'rotation': R_total.cpu().numpy().tolist(),
+        'translation': t.cpu().numpy().tolist(),
         'R_model2cv': R_model2cv.cpu().numpy().tolist(),
-        'R_align': R_align.cpu().numpy().tolist(),
-        'best_iou': float(best_iou_fine),
-        'method': 'c2w_rotation + scale_search + multiview_finetune',
+        'init_yaw_deg': math.degrees(init_yaw),
+        'method': 'multiview_alignment_module',
     }
     with open(os.path.join(args.output_dir, "alignment_params.json"), 'w') as f:
         json.dump(params, f, indent=2)
     print(f"\n  Saved {ply_path}")
-    print(f"Step 2 complete. IoU = {best_iou_fine:.4f}")
+    print(f"Step 2 complete.")
 
 
 # ── Step 3: Render from all training poses ────────────────────────────────
@@ -383,8 +261,7 @@ def step3_render(args):
     # Save comparison video.
     video_path = os.path.join(args.output_dir, "alignment_check.mp4")
     H, W = comparison_frames[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    vw = cv2.VideoWriter(video_path, fourcc, 5, (W, H))
+    vw, video_path = create_video_writer(video_path, "mp4v", 5, (W, H))
     for frame in comparison_frames:
         vw.write(frame)
     vw.release()

@@ -10,6 +10,7 @@ import cv2
 
 from .smpl_model import SMPLWrapper
 from .skinned_gaussians import SkinnedGaussians
+from multiview_refine.video_io import create_video_writer
 
 
 def render_animation(
@@ -61,8 +62,7 @@ def render_animation(
 
     # Determine video dimensions.
     W, H = camera.width, camera.height
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    vw = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+    vw, output_path = create_video_writer(output_path, "mp4v", fps, (W, H))
 
     if verbose:
         print(f"\nRendering {n_frames} frames at {W}x{H} @ {fps} fps...")
@@ -70,18 +70,34 @@ def render_animation(
 
     for frame_idx in range(n_frames):
         # Compute joint transforms for this frame.
-        joint_transforms = smpl.get_joint_transforms(
+        # Support both SMPL (24 joints) and SMPL-X (55 joints) via keyword args.
+        kwargs = dict(
             betas=betas,
             body_pose=body_pose[frame_idx],
             global_orient=global_orient[frame_idx],
             transl=transl[frame_idx] if transl is not None else None,
         )
+        # SMPL-X specific: jaw, eyes, expression.
+        if 'jaw_pose' in pose_sequence and pose_sequence['jaw_pose'] is not None:
+            kwargs['jaw_pose'] = pose_sequence['jaw_pose'][frame_idx]
+        if 'leye_pose' in pose_sequence and pose_sequence['leye_pose'] is not None:
+            kwargs['leye_pose'] = pose_sequence['leye_pose'][frame_idx]
+        if 'reye_pose' in pose_sequence and pose_sequence['reye_pose'] is not None:
+            kwargs['reye_pose'] = pose_sequence['reye_pose'][frame_idx]
+        if 'expression' in pose_sequence and pose_sequence['expression'] is not None:
+            kwargs['expression'] = pose_sequence['expression'][frame_idx]
+
+        joint_transforms = smpl.get_joint_transforms(**kwargs)
+
+        # Expression coefficients for blendshape deformation.
+        expr_coeffs = kwargs.get('expression', None)
 
         # Deform + render.
         with torch.no_grad():
             rgb, alpha, meta = skinned.render_posed(
                 joint_transforms, camera,
                 background=background, sh_degree=sh_degree,
+                expression=expr_coeffs,
             )
 
         # Convert to BGR for OpenCV.
@@ -133,8 +149,7 @@ def render_animation_comparison(
         background = torch.zeros(3, device=device)
 
     W, H = camera.width, camera.height
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    vw = cv2.VideoWriter(output_path, fourcc, fps, (W * 2, H))
+    vw, output_path = create_video_writer(output_path, "mp4v", fps, (W * 2, H))
 
     # Rest-pose joint transforms (all zeros).
     rest_transforms = smpl.get_joint_transforms(betas=betas)

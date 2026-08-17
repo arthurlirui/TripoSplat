@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 
 from .smpl_model import SMPLWrapper
 from .skinned_gaussians import SkinnedGaussians
-
+from multiview_refine.ply_io import load_gaussians_ply
 
 def rig_gaussians_to_smpl(
     means: torch.Tensor,          # (N, 3) static Gaussian positions
@@ -107,33 +107,101 @@ def rig_gaussians_to_smpl(
     )
 
 
-def load_static_gaussians(ply_path: str, device: str = 'cuda'):
-    """Load a standard 3DGS PLY and return raw attributes.
+def rig_gaussians_to_smplx(
+    means: torch.Tensor,
+    scales_raw: torch.Tensor,
+    quats: torch.Tensor,
+    opacities_raw: torch.Tensor,
+    sh0: torch.Tensor,
+    smplx,                          # SMPLXWrapper
+    betas: torch.Tensor | None = None,
+    expression: torch.Tensor | None = None,
+    n_neighbours: int = 4,
+    temperature: float = 0.05,
+    device: str = 'cuda',
+    weights_optimizable: bool = True,
+    n_expression_bases: int = 100,
+) -> SkinnedGaussians:
+    """Bind Gaussians to SMPL-X skeleton with expression blendshape support.
 
-    Returns: (means, scales_raw, quats, opacities_raw, sh0)
+    In addition to skinning weights (55 joints), this also computes per-Gaussian
+    expression displacement bases by interpolating from SMPL-X mesh vertices.
+
+    Args:
+        smplx: SMPLXWrapper instance.
+        expression: (100,) expression coefficients for rest-pose mesh.
+        n_expression_bases: number of expression blendshape bases to store.
+        weights_optimizable: if True, skin weights can be fine-tuned during
+            optimization (with L2 regularization to SMPL-X prior).
+
+    Returns:
+        SkinnedGaussians with 55-joint skinning weights + expression bases.
     """
-    from plyfile import PlyData
+    print("Rigging Gaussians to SMPL-X skeleton (55 joints + expression)...")
 
-    plydata = PlyData.read(ply_path)
-    v = plydata['vertex']
-    data = np.stack([v[name] for name in v.data.dtype.names], axis=1)
-    names = list(v.data.dtype.names)
+    # Get SMPL-X rest-pose mesh (with expression applied if given).
+    rest_verts, _ = smplx.get_rest_mesh(betas, expression)  # (10475, 3)
+    smpl_weights = smplx.get_skinning_weights()  # (10475, 55)
 
-    def col(name):
-        return data[:, names.index(name)]
+    N = means.shape[0]
+    rest_verts_np = rest_verts.cpu().numpy()
+    smpl_weights_np = smpl_weights.cpu().numpy()
+    means_np = means.cpu().numpy()
 
-    means = np.stack([col('x'), col('y'), col('z')], axis=-1)
-    f_dc = np.stack([col('f_dc_0'), col('f_dc_1'), col('f_dc_2')], axis=-1)
-    sh0 = f_dc[:, None, :]
-    opacities = col('opacity')
-    scales = np.stack([col('scale_0'), col('scale_1'), col('scale_2')], axis=-1)
-    quats = np.stack([col('rot_0'), col('rot_1'), col('rot_2'), col('rot_3')], axis=-1)
+    # Build KD-tree on SMPL-X vertices.
+    tree = cKDTree(rest_verts_np)
+    dists, indices = tree.query(means_np, k=n_neighbours)
 
-    dev = torch.device(device)
-    return (
-        torch.from_numpy(means).float().to(dev),
-        torch.from_numpy(scales).float().to(dev),
-        torch.from_numpy(quats).float().to(dev),
-        torch.from_numpy(opacities).float().to(dev),
-        torch.from_numpy(sh0).float().to(dev),
+    if n_neighbours == 1:
+        dists = dists.reshape(-1, 1)
+        indices = indices.reshape(-1, 1)
+
+    # Softmax over inverse distances.
+    logits = -dists / max(temperature, 1e-8)
+    logits = logits - logits.max(axis=-1, keepdims=True)
+    exp_logits = np.exp(logits)
+    neighbour_weights = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
+
+    # Inherit 55-joint skinning weights.
+    neighbour_smpl_weights = smpl_weights_np[indices]  # (N, K_nn, 55)
+    skin_weights = np.einsum('nk,nkj->nj', neighbour_weights, neighbour_smpl_weights)
+    row_sums = np.maximum(skin_weights.sum(axis=-1, keepdims=True), 1e-8)
+    skin_weights = skin_weights / row_sums
+
+    # Interpolate expression blendshape bases from SMPL-X mesh.
+    # shapedirs_expr: (10475, 3, 100) → per-vertex expression displacement.
+    # For each Gaussian, interpolate the expression bases from nearest vertices.
+    smpl_expr_bases = smplx.shapedirs_expr.cpu().numpy()  # (10475, 3, 100)
+    # neighbour expr bases: (N, K_nn, 3, 100)
+    neighbour_expr = smpl_expr_bases[indices]  # (N, K_nn, 3, n_expr)
+    # Weighted interpolation: (N, 3, n_expr) = Σ w_i * expr_i
+    n_expr = min(n_expression_bases, smpl_expr_bases.shape[2])
+    expr_basis = np.einsum('nk,nkje->nje', neighbour_weights, neighbour_expr[:, :, :, :n_expr])
+    # Transpose to (N, n_expr, 3) for storage.
+    expr_basis = expr_basis.transpose(0, 2, 1)  # (N, n_expr, 3)
+
+    # Stats.
+    n_rigid = (skin_weights.max(axis=-1) > 0.99).sum()
+    print(f"  {N} Gaussians rigged to {smplx.NUM_JOINTS} joints")
+    print(f"  Expression bases: {n_expr}")
+    print(f"  Rigid (single-joint) Gaussians: {n_rigid} ({100*n_rigid/N:.1f}%)")
+    print(f"  Mean max weight: {skin_weights.max(axis=-1).mean():.4f}")
+    print(f"  Expression basis norm: mean={np.linalg.norm(expr_basis, axis=(1,2)).mean():.6f}")
+    print(f"  Weights optimizable: {weights_optimizable}")
+
+    # Create SkinnedGaussians with expression + optimizable weights.
+    skin_weights_t = torch.from_numpy(skin_weights).float().to(device)
+    expr_basis_t = torch.from_numpy(expr_basis).float().to(device)
+    return SkinnedGaussians.from_attributes(
+        means=means.to(device),
+        scales_raw=scales_raw.to(device),
+        quats=quats.to(device),
+        opacities_raw=opacities_raw.to(device),
+        sh0=sh0.to(device),
+        skin_weights=skin_weights_t,
+        n_joints=smplx.NUM_JOINTS,
+        sh_degree=0,
+        device=device,
+        expr_basis=expr_basis_t,
+        weights_optimizable=weights_optimizable,
     )

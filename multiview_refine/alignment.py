@@ -51,12 +51,12 @@ def _apply_transform(means, scales, quats, scale, R, t):
     scales: s * scales
     quats: compose R's quaternion with each Gaussian's quaternion
     """
-    from .gaussian_model import _rotation_matrix_to_quaternion, _quaternion_compose
+    from .quaternion import quaternion_compose, rotation_matrix_to_quaternion
 
     means_new = scale * (means @ R.T) + t
     scales_new = scales * scale
-    q_R = _rotation_matrix_to_quaternion(R)  # (4,)
-    quats_new = _quaternion_compose(q_R, quats)  # (N, 4)
+    q_R = rotation_matrix_to_quaternion(R)  # (4,)
+    quats_new = quaternion_compose(q_R, quats)  # (N, 4)
     return means_new, scales_new, quats_new
 
 
@@ -176,13 +176,15 @@ def _estimate_translation(means, cameras, real_masks):
 
 
 def estimate_similarity_transform_multiview(
-    tripo_gaussian,
-    cameras: list[Camera],
+    tripo_gaussian=None,
+    tensors: tuple | None = None,
+    cameras: list[Camera] | None = None,
     rmbg_fn: Callable | None = None,
     n_rotation_samples: int = 24,
     n_scale_samples: int = 10,
     scale_range: tuple[float, float] = (0.05, 2.0),
     alpha_threshold: float = 0.1,
+    init_yaw: float | None = None,
     verbose: bool = True,
 ) -> tuple[float, torch.Tensor, torch.Tensor]:
     """Estimate 7-DoF similarity transform via multi-view silhouette matching.
@@ -193,6 +195,10 @@ def estimate_similarity_transform_multiview(
 
     Args:
         tripo_gaussian: TripoSplat ``Gaussian`` object (in AABB coordinates).
+            Ignored if *tensors* is provided.
+        tensors: Optional ``(means, scales, quats, opacities, colors)`` tuple.
+            When given, bypasses the Gaussian extraction step — useful when
+            the data has already been loaded from PLY and pre-transformed.
         cameras: List of multi-view cameras (with loaded images).
         rmbg_fn: Background removal function (PIL → RGBA). If None, uses
             image brightness as foreground mask.
@@ -200,13 +206,22 @@ def estimate_similarity_transform_multiview(
         n_scale_samples: Number of scale samples.
         scale_range: (min_scale, max_scale) to search.
         alpha_threshold: Threshold for rendered alpha → binary silhouette.
+        init_yaw: If given (radians), the coarse yaw search is centered around
+            this value instead of doing a full 360° sweep. Improves speed when
+            a good initial estimate is available (e.g. from c2w alignment).
         verbose: Print progress.
 
     Returns:
         (scale, R (3,3), t (3,)) such that ``xyz_scene = s * (R @ xyz_tripo) + t``.
     """
+    if tensors is not None:
+        means, scales, quats, opacities, colors = tensors
+    else:
+        assert tripo_gaussian is not None, "Either tripo_gaussian or tensors must be provided"
+        device = cameras[0].device
+        means, scales, quats, opacities, colors = _tripo_gaussian_to_tensors(tripo_gaussian, device)
+
     device = cameras[0].device
-    means, scales, quats, opacities, colors = _tripo_gaussian_to_tensors(tripo_gaussian, device)
 
     if verbose:
         print(f"  Gaussians: {means.shape[0]}, means range [{means.min():.3f}, {means.max():.3f}]")
@@ -223,7 +238,12 @@ def estimate_similarity_transform_multiview(
     # Rotation: sample yaw (around Y), pitch (around X), roll (around Z).
     # For efficiency, first search yaw (most important for orbit datasets),
     # then refine pitch and roll.
-    yaw_samples = np.linspace(0, 2 * math.pi, n_rotation_samples, endpoint=False)
+    if init_yaw is not None:
+        half_window = math.pi / 4  # narrow window around the hint
+        yaw_samples = np.linspace(init_yaw - half_window, init_yaw + half_window,
+                                  n_rotation_samples, endpoint=False)
+    else:
+        yaw_samples = np.linspace(0, 2 * math.pi, n_rotation_samples, endpoint=False)
     scale_samples = np.linspace(scale_range[0], scale_range[1], n_scale_samples)
 
     best_iou = -1.0

@@ -36,47 +36,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".")
 
 from multiview_refine.cameras import Camera, load_cameras, invert_se3
 from multiview_refine.gsplat_wrapper import render_gaussians
+from multiview_refine.ply_io import load_gaussians_ply
+from multiview_refine.video_io import create_video_writer
 
 SH_C0 = 0.28209479177387814
-
-
-# ── PLY loading ────────────────────────────────────────────────────────────
-
-def load_ply_to_gaussians(ply_path: str, device: str = "cuda"):
-    """Load a 3DGS-compatible PLY and return raw Gaussian attributes."""
-    from plyfile import PlyData
-
-    plydata = PlyData.read(ply_path)
-    v = plydata["vertex"]
-    data = np.stack([v[name] for name in v.data.dtype.names], axis=1)
-    names = list(v.data.dtype.names)
-
-    def col(name):
-        return data[:, names.index(name)]
-
-    means = np.stack([col("x"), col("y"), col("z")], axis=-1)
-    f_dc = np.stack([col("f_dc_0"), col("f_dc_1"), col("f_dc_2")], axis=-1)
-    sh0 = f_dc[:, None, :]  # (N, 1, 3)
-    f_rest_names = sorted([n for n in names if n.startswith("f_rest_")])
-    if f_rest_names:
-        f_rest = np.stack([col(n) for n in f_rest_names], axis=-1)
-        shN = f_rest.reshape(-1, len(f_rest_names) // 3, 3)
-    else:
-        shN = np.zeros((means.shape[0], 0, 3), dtype=np.float32)
-
-    opacities = col("opacity")
-    scales = np.stack([col("scale_0"), col("scale_1"), col("scale_2")], axis=-1)
-    quats = np.stack([col("rot_0"), col("rot_1"), col("rot_2"), col("rot_3")], axis=-1)
-
-    device = torch.device(device)
-    return (
-        torch.from_numpy(means).float().to(device),
-        torch.from_numpy(scales).float().to(device),
-        torch.from_numpy(quats).float().to(device),
-        torch.from_numpy(opacities).float().to(device),
-        torch.from_numpy(sh0).float().to(device),
-        torch.from_numpy(shN).float().to(device),
-    )
 
 
 # ── Orbit trajectory ───────────────────────────────────────────────────────
@@ -141,7 +104,7 @@ def main():
 
     # ── Load Gaussians ──
     print(f"Loading Gaussians from {args.ply}...")
-    means, scales_raw, quats, opacities_raw, sh0, shN = load_ply_to_gaussians(args.ply, device)
+    means, scales_raw, quats, opacities_raw, sh0, shN = load_gaussians_ply(args.ply, device)
     n = means.shape[0]
     print(f"  {n} Gaussians, means range [{means.min():.3f}, {means.max():.3f}]")
     print(f"  scale_boost = {args.scale_boost}")
@@ -228,13 +191,8 @@ def main():
     out_W = W * 2 if args.compare_gt and args.use_real_cameras else W
     out_H = H
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv2.VideoWriter(args.output, fourcc, args.fps, (out_W, out_H))
-    if not video_writer.isOpened():
-        print("ERROR: VideoWriter failed, trying .avi...")
-        args.output = args.output.replace(".mp4", ".avi")
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        video_writer = cv2.VideoWriter(args.output, fourcc, args.fps, (out_W, out_H))
+    video_writer, args.output = create_video_writer(
+        args.output, "mp4v", args.fps, (out_W, out_H))
 
     for i, cam in enumerate(cameras_to_render):
         with torch.no_grad():

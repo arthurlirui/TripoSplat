@@ -109,12 +109,32 @@ def generate_demo_poses(
     # Global translation: stay in place
     transl = torch.zeros(n_frames, 3, device=dev)
 
-    print(f"  Generated {n_frames} demo frames (arm wave + rotation)")
+    # Jaw pose: mouth open/close (SMPL-X joint 22).
+    jaw_pose = torch.zeros(n_frames, 3, device=dev)
+    jaw_pose[:, 0] = (torch.sin(t * 2) * 0.3 + 0.3).clamp(min=0)  # jaw opens periodically
+
+    # Eye pose: subtle gaze movement (SMPL-X joints 23, 24).
+    leye_pose = torch.zeros(n_frames, 3, device=dev)
+    leye_pose[:, 1] = torch.sin(t * 0.3) * 0.2  # L eye look left/right
+    reye_pose = torch.zeros(n_frames, 3, device=dev)
+    reye_pose[:, 1] = torch.sin(t * 0.3) * 0.2  # R eye same direction
+
+    # Expression coefficients: 100-dim, use first few for simple expressions.
+    # Expression 0: mouth smile, Expression 1: brow raise, etc.
+    expression = torch.zeros(n_frames, 100, device=dev)
+    expression[:, 0] = torch.sin(t) * 0.5  # smile/frown cycle
+    expression[:, 1] = torch.sin(t * 0.7) * 0.3  # brow movement
+
+    print(f"  Generated {n_frames} demo frames (arm wave + rotation + jaw + expression)")
     return {
         'betas': betas,
         'body_pose': body_pose,
         'global_orient': global_orient,
         'transl': transl,
+        'jaw_pose': jaw_pose,
+        'leye_pose': leye_pose,
+        'reye_pose': reye_pose,
+        'expression': expression,
         'n_frames': n_frames,
     }
 

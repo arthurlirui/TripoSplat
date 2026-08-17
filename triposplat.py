@@ -11,6 +11,7 @@ from model import (
     OctreeProbabilityFixedlenDecoder, ElasticGaussianFixedlenDecoder,
     LatentSeqMMFlowModel, OctreeGaussianDecoder,
 )
+from multiview_refine.quaternion import quat_to_matrix, matrix_to_quat
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +134,9 @@ class Gaussian:
         if transform is not None:
             transform = np.array(transform)
             xyz = np.matmul(xyz, transform.T)
-            R_mat = _quat_to_matrix(rotation)
+            R_mat = quat_to_matrix(rotation)
             R_mat = np.matmul(transform, R_mat)
-            rotation = _matrix_to_quat(R_mat)
+            rotation = matrix_to_quat(R_mat)
         return xyz, normals, f_dc, opacities, scale, rotation
 
     def _transformed_xyz_rot(self, transform=None):
@@ -145,9 +146,9 @@ class Gaussian:
         xyz = self.get_xyz.detach().cpu().numpy().astype(np.float32)
         rotation = (self._rotation + self.rots_bias[None, :]).detach().cpu().numpy()
         xyz = np.matmul(xyz, transform.T)
-        R_mat = _quat_to_matrix(rotation)
+        R_mat = quat_to_matrix(rotation)
         R_mat = np.matmul(transform, R_mat)
-        rotation = _matrix_to_quat(R_mat)
+        rotation = matrix_to_quat(R_mat)
         return xyz, rotation
 
     def to_ply_bytes(self, transform=None) -> bytes:
@@ -202,46 +203,6 @@ def _binary_ply_bytes(elements, dtype_full) -> bytes:
         header += f"property {type_map.get(t, t)} {name}\n"
     header += "end_header\n"
     return header.encode('ascii') + elements.tobytes()
-
-
-def _quat_to_matrix(q):
-    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    R = np.stack([
-        1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y),
-        2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x),
-        2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y),
-    ], axis=-1).reshape(-1, 3, 3)
-    return R
-
-
-def _matrix_to_quat(R):
-    trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
-    q = np.zeros((R.shape[0], 4), dtype=R.dtype)
-    s = np.sqrt(np.maximum(trace + 1, 0)) * 2
-    q[:, 0] = 0.25 * s
-    q[:, 1] = (R[:, 2, 1] - R[:, 1, 2]) / np.where(s != 0, s, 1)
-    q[:, 2] = (R[:, 0, 2] - R[:, 2, 0]) / np.where(s != 0, s, 1)
-    q[:, 3] = (R[:, 1, 0] - R[:, 0, 1]) / np.where(s != 0, s, 1)
-    m01 = (R[:, 0, 0] >= R[:, 1, 1]) & (R[:, 0, 0] >= R[:, 2, 2]) & (s == 0)
-    s1 = np.sqrt(np.maximum(1 + R[:, 0, 0] - R[:, 1, 1] - R[:, 2, 2], 0)) * 2
-    q[m01, 0] = (R[m01, 2, 1] - R[m01, 1, 2]) / s1[m01]
-    q[m01, 1] = 0.25 * s1[m01]
-    q[m01, 2] = (R[m01, 0, 1] + R[m01, 1, 0]) / s1[m01]
-    q[m01, 3] = (R[m01, 0, 2] + R[m01, 2, 0]) / s1[m01]
-    m11 = (R[:, 1, 1] > R[:, 0, 0]) & (R[:, 1, 1] >= R[:, 2, 2]) & (s == 0)
-    s2 = np.sqrt(np.maximum(1 + R[:, 1, 1] - R[:, 0, 0] - R[:, 2, 2], 0)) * 2
-    q[m11, 0] = (R[m11, 0, 2] - R[m11, 2, 0]) / s2[m11]
-    q[m11, 1] = (R[m11, 0, 1] + R[m11, 1, 0]) / s2[m11]
-    q[m11, 2] = 0.25 * s2[m11]
-    q[m11, 3] = (R[m11, 1, 2] + R[m11, 2, 1]) / s2[m11]
-    m21 = (R[:, 2, 2] > R[:, 0, 0]) & (R[:, 2, 2] > R[:, 1, 1]) & (s == 0)
-    s3 = np.sqrt(np.maximum(1 + R[:, 2, 2] - R[:, 0, 0] - R[:, 1, 1], 0)) * 2
-    q[m21, 0] = (R[m21, 1, 0] - R[m21, 0, 1]) / s3[m21]
-    q[m21, 1] = (R[m21, 0, 2] + R[m21, 2, 0]) / s3[m21]
-    q[m21, 2] = (R[m21, 1, 2] + R[m21, 2, 1]) / s3[m21]
-    q[m21, 3] = 0.25 * s3[m21]
-    return q / np.linalg.norm(q, axis=-1, keepdims=True)
 
 
 def _build_gaussians(decoder: ElasticGaussianFixedlenDecoder, points_pred: dict, pred: dict):
