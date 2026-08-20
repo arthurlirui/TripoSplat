@@ -29,7 +29,7 @@ from .cameras import (
 from .gaussian_model import RefineableGaussians
 from .gsplat_wrapper import render_gaussians
 from .losses import compute_loss, compute_psnr
-from .alignment import estimate_similarity_transform
+from .alignment import estimate_similarity_transform, align_from_known_c2w
 
 
 def refine_from_multiview(
@@ -133,13 +133,11 @@ def refine_from_multiview(
     if hasattr(pipe, "rmbg") and pipe.rmbg is not None:
         rmbg_fn = pipe.rmbg.remove_background
 
-    scale, R, t = estimate_similarity_transform(
+    scale, R, t = align_from_known_c2w(
         tripo_gaussian,
         init_camera,
-        init_camera.image,
-        depth_estimator=None,
+        cameras,
         rmbg_fn=rmbg_fn,
-        cameras=cameras,
         alpha_threshold=0.1,
         verbose=verbose,
     )

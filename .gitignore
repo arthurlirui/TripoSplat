@@ -236,3 +236,5 @@ __marimo__/
 
 # ZCode session files
 /.zcode/
+/real_body_demo
+/smplx_demo
