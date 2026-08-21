@@ -134,6 +134,10 @@ def main():
     parser.add_argument('--output_dir', default='real_body_demo')
     parser.add_argument('--n_frames', type=int, default=240)
     parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--scale_boost', type=float, default=10.0,
+                        help='Multiply Gaussian scales for visibility '
+                             '(reconstructed scales are often too small).')
+    parser.add_argument('--camera_radius', type=float, default=5.0)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
 
@@ -154,8 +158,13 @@ def main():
     # Prune dark opaque floaters.
     colors_eval = (sh0[:, 0, :] * SH_C0 + 0.5).clamp(0, 1)
     keep = ~((colors_eval.max(dim=-1).values < 0.01) & (opacities > 0.5))
-    print(f"  Pruning {(~keep).sum().item()} dark floaters → {keep.sum().item()} remaining")
+    print(f"  Pruning {(~keep).sum().item()} dark floaters -> {keep.sum().item()} remaining")
     means, scales_raw, quats, opac_raw, sh0 = [x[keep] for x in [means, scales_raw, quats, opac_raw, sh0]]
+
+    # Boost scales for visibility (reconstructed Gaussians are often sub-pixel).
+    if args.scale_boost != 1.0:
+        scales_raw = scales_raw + math.log(args.scale_boost)
+        print(f"  Scale boost: {args.scale_boost}x")
 
     # ═══ 2. Load SMPL-X + align ═══
     print(f"\nStep 2: Load SMPL-X + align to Gaussian cloud")
@@ -186,7 +195,7 @@ def main():
     # ═══ 5. Generate actions + orbit cameras ═══
     print(f"\nStep 5: Generate {args.n_frames} action frames + orbit cameras")
     pose_seq = generate_body_actions(args.n_frames, device)
-    cameras = make_orbit_cameras(gc, args.n_frames, device)
+    cameras = make_orbit_cameras(gc, args.n_frames, device, radius=args.camera_radius)
 
     # ═══ 6. Render ═══
     print(f"\nStep 6: Render {args.n_frames} frames (orbit + actions)")
