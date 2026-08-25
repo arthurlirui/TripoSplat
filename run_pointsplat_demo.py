@@ -47,6 +47,14 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# On torch>=2.7, gsplat 1.5.x's JIT loader passes a stale _jit_compile
+# signature and fails even when a compiled .pyd is cached. Preload the cached
+# extension if available so ``gsplat.rasterization`` works. No-op otherwise.
+try:
+    import pointsplat_bridge._gsplat_preload  # noqa: F401
+except Exception:
+    pass
+
 SH_C0 = 0.28209479177387814
 
 
@@ -222,7 +230,8 @@ def main():
 
     # Step 7: Save key frames.
     print(f"\nStep 7: Save key frames")
-    for idx in [0, 60, 120, 180]:
+    key_indices = [i for i in [0, 60, 120, 180] if i < args.n_frames]
+    for idx in key_indices:
         T = smplx.get_joint_transforms(
             body_pose=pose_seq["body_pose"][idx],
             global_orient=pose_seq["global_orient"][idx],

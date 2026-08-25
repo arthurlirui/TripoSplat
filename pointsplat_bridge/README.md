@@ -77,24 +77,44 @@ unzip third_party/pointsplat/datasets/DNA_Rendering_example.zip \
 
 ## 4. Run the end-to-end demo
 
-From the repo root, using TripoSplat's own env (e.g. `gs`):
+The render side (steps 2–7: load → align → rig → animate → render) needs
+**gsplat 1.5.x** (`gsplat.rasterization` + `gsplat.strategy`), the API the whole
+`multiview_refine` package is written against. A bare `gs` env with gsplat 0.1.0
+will *not* work — its CUDA extension is prebuilt but it only exposes the old
+`rasterize` API.
+
+Two render-env options:
+
+**A. Use an existing torch≥2.7 env with a prebuilt gsplat CUDA extension.**
+On torch 2.7+, gsplat 1.5.x's JIT loader passes a stale `_jit_compile` signature
+and fails even when a compiled `gsplat_cuda.pyd` is cached. The demo auto-imports
+`pointsplat_bridge/_gsplat_preload.py`, which loads the cached `.pyd` directly
+and registers it as `gsplat.csrc`, sidestepping the broken JIT path. This was
+verified with the `rtg132` env (torch 2.12 + CUDA 13.2, cached extension built
+2025-08-12):
 
 ```bash
-conda activate gs            # or whichever env runs your TripoSplat
-export PYTHONUTF8=1
-python run_pointsplat_demo.py \
+# rtg132 python directly (conda activate can trip on this conda version):
+C:/Users/pcl/.conda/envs/rtg132/python.exe run_pointsplat_demo.py \
   --dataset_root third_party/pointsplat/datasets/THuman2_0_example \
-  --experiment pointsplat_thuman \
-  --conda_env pointsplat \
+  --experiment pointsplat_thuman --conda_env pointsplat \
   --smpl_model_path E:/Code/mmforall/model/assets/SMPLX/SMPLX_NEUTRAL_2020.npz \
-  --output_dir pointsplat_demo \
-  --n_frames 240 --fps 30
+  --output_dir pointsplat_demo --n_frames 240 --fps 30
 ```
+
+**B. A torch 2.6 / cu124 env with a *working* CUDA toolchain (MSVC ≤ 2022).**
+`pip install gsplat==1.5.3` then let it JIT-compile on first run. Note: on this
+machine the cu124 JIT path fails because nvcc 12.4 rejects the installed MSVC
+("unsupported Microsoft Visual Studio version"), so option A is the known-good
+path here.
+
+Set `PYTHONUTF8=1` if you see Unicode errors on Windows.
 
 Outputs land in `pointsplat_demo/`:
 - `pointsplat_demo.mp4` — orbit-camera animation with SMPL-X body actions
   (wave → both arms raise → body turn + reach → return), plus jaw/expression.
-- `frame_000/060/120/180.png` — key frame screenshots.
+- `frame_000/060/120/180.png` — key frame screenshots (indices clamped to
+  `--n_frames`).
 
 PointSplat's own artifacts (the generated PLY, intermediate images) are written
 to `pointsplat_bridge/runs/<timestamp>/` unless `--ps_output_dir` is set.
@@ -134,6 +154,11 @@ and add a matching Hydra config — outside the scope of this bridge.
   Never imports torch/PointSplat itself, so it's importable from TripoSplat's
   runtime.
 
+- `_gsplat_preload.py` — loads a cached `gsplat_cuda.pyd` and registers it as
+  `gsplat.csrc` so gsplat 1.5.x's `rasterization` works on torch≥2.7, where the
+  built-in JIT loader breaks on a stale `_jit_compile` signature. Auto-imported
+  by `run_pointsplat_demo.py`; no-op if no cached extension is found.
+
 - `run_pointsplat_demo.py` (repo root) — entry point. Step 1 calls the bridge;
   steps 2–7 reuse the load/align/rig/animate/render flow from
   `run_real_body_demo.py` (shared via `import run_real_body_demo`).
@@ -151,3 +176,9 @@ and add a matching Hydra config — outside the scope of this bridge.
 - **TripoSplat render side fails on the PLY** — the PLY PointSplat writes is
   standard 3DGS; if `load_gaussians_ply` complains about missing fields, check
   that you're not mixing PLYs from a different writer.
+- **`Ninja is required to load C++ extensions` or `_jit_compile() missing ...`
+  on the render side** — you're on torch≥2.7 and gsplat's JIT loader is broken.
+  The auto-preload needs a cached `gsplat_cuda.pyd` under
+  `%LOCALAPPDATA%\torch_extensions\...\Cache\<py_cu_tag>\gsplat_cuda\`. If absent,
+  build one once from a torch 2.6 / matching-MSVC env (option B), or use an env
+  that already has a cached extension (option A, e.g. `rtg132`).
