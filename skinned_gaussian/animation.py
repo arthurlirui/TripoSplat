@@ -78,19 +78,22 @@ def render_animation(
             transl=transl[frame_idx] if transl is not None else None,
         )
         # SMPL-X specific: jaw, eyes, expression.
-        if 'jaw_pose' in pose_sequence and pose_sequence['jaw_pose'] is not None:
-            kwargs['jaw_pose'] = pose_sequence['jaw_pose'][frame_idx]
-        if 'leye_pose' in pose_sequence and pose_sequence['leye_pose'] is not None:
-            kwargs['leye_pose'] = pose_sequence['leye_pose'][frame_idx]
-        if 'reye_pose' in pose_sequence and pose_sequence['reye_pose'] is not None:
-            kwargs['reye_pose'] = pose_sequence['reye_pose'][frame_idx]
-        if 'expression' in pose_sequence and pose_sequence['expression'] is not None:
-            kwargs['expression'] = pose_sequence['expression'][frame_idx]
+        # Only pass these if the model supports them (SMPL-X has 55+ joints).
+        is_smplx = hasattr(smpl, 'NUM_JOINTS') and smpl.NUM_JOINTS > 24
+        if is_smplx:
+            if 'jaw_pose' in pose_sequence and pose_sequence['jaw_pose'] is not None:
+                kwargs['jaw_pose'] = pose_sequence['jaw_pose'][frame_idx]
+            if 'leye_pose' in pose_sequence and pose_sequence['leye_pose'] is not None:
+                kwargs['leye_pose'] = pose_sequence['leye_pose'][frame_idx]
+            if 'reye_pose' in pose_sequence and pose_sequence['reye_pose'] is not None:
+                kwargs['reye_pose'] = pose_sequence['reye_pose'][frame_idx]
+            if 'expression' in pose_sequence and pose_sequence['expression'] is not None:
+                kwargs['expression'] = pose_sequence['expression'][frame_idx]
 
         joint_transforms = smpl.get_joint_transforms(**kwargs)
 
-        # Expression coefficients for blendshape deformation.
-        expr_coeffs = kwargs.get('expression', None)
+        # Expression coefficients for blendshape deformation (only for SMPL-X).
+        expr_coeffs = kwargs.get('expression', None) if is_smplx else None
 
         # Deform + render.
         with torch.no_grad():

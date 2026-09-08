@@ -89,29 +89,23 @@ class SMPLWrapper:
         self._align_transl = torch.zeros(3, device=self.device)
         self._aligned = False
 
-    def align_to_scene(self, scale: float, transl: torch.Tensor) -> "SMPLWrapper":
-        """Return a new SMPL instance aligned to the scene coordinate system.
+    def align_to_scene(self, scale: float, transl: torch.Tensor) -> None:
+        """Scale + translate this SMPL instance in-place to match the scene.
 
-        The original instance is **not** modified — callers must use the
-        returned object for subsequent operations.
+        Modifies v_template and shapedirs so that get_rest_mesh(),
+        get_rest_joints(), and get_joint_transforms() all operate in the
+        scene coordinate system.
 
         Args:
             scale: uniform scale factor.
             transl: (3,) translation vector.
-
-        Returns:
-            A new :class:`SMPLWrapper` with ``v_template`` and ``shapedirs``
-            scaled and translated to match the scene.
         """
-        import copy
-        aligned = copy.deepcopy(self)
-        aligned.v_template = self.v_template * scale + transl.to(self.device)
-        aligned.shapedirs = self.shapedirs * scale
-        aligned._align_scale = scale
-        aligned._align_transl = transl.to(self.device)
-        aligned._aligned = True
+        self._align_scale = scale
+        self._align_transl = transl.to(self.device)
+        self.v_template = self.v_template * scale + self._align_transl
+        self.shapedirs = self.shapedirs * scale
+        self._aligned = True
         print(f"  SMPL aligned: scale={scale:.3f}, transl={transl.tolist()}")
-        return aligned
 
     # ── Rest pose ──────────────────────────────────────────────────────
 

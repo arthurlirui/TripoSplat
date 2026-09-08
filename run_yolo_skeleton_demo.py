@@ -364,16 +364,27 @@ def main():
     print(f"  Loaded {len(means)} Gaussians, pruning {(~keep).sum()} → {keep.sum()} remaining")
     means, scales_raw, quats, opac_raw, sh0 = [x[keep] for x in [means, scales_raw, quats, opac_raw, sh0]]
 
-    # Boost scales for visibility.
-    scales_raw = scales_raw + math.log(10.0)
+    # NOTE: Do NOT boost scales — the reconstructed Gaussians are already
+    # optimized at the correct scale (PSNR=30 without boost vs 14 with 10x boost).
+    # Boosting destroys rendering quality.
 
-    # Align SMPL to Gaussian cloud (for rigging).
+    # Optimize SMPL scale by minimizing Gaussian-to-SMPL surface distance.
     gc = means.median(0).values
-    gs_h = (means[:, 1].max() - means[:, 1].min()).item()
-    rest_verts, _ = smpl.get_rest_mesh()
-    smpl_h = (rest_verts[:, 1].max() - rest_verts[:, 1].min()).item()
-    smpl_scale = gs_h / smpl_h
+    from scipy.optimize import minimize_scalar
+    from scipy.spatial import cKDTree
+
+    def coverage_score(scale_val):
+        test_smpl = SMPLWrapper(args.smpl_model_path, device=device)
+        test_smpl.align_to_scene(scale=scale_val, transl=gc)
+        v, _ = test_smpl.get_rest_mesh()
+        tree = cKDTree(v.cpu().numpy())
+        dists, _ = tree.query(means.cpu().numpy(), k=1)
+        return dists.mean()
+
+    result = minimize_scalar(coverage_score, bounds=(0.5, 10.0), method='bounded')
+    smpl_scale = result.x
     smpl.align_to_scene(scale=smpl_scale, transl=gc)
+    print(f"  Optimized SMPL scale: {smpl_scale:.3f} (mean_dist={result.fun:.4f})")
 
     skinned = rig_gaussians_to_smpl(
         means, scales_raw, quats, opac_raw, sh0, smpl,
@@ -392,7 +403,11 @@ def main():
     W, H = 1024, 768
 
     # Camera orbit around the body.
-    radius = 5.0
+    # Use a radius and focal length that match the original dataset scale.
+    # Original cameras are at distance ~2.6 from centre, fx~1790 (full res).
+    # At 1024 width: fx = 1790 * 1024/2048 = 895, radius = 3.0.
+    radius = 3.0
+    fx_render = 900.0
     elev = math.radians(10)
 
     # Also render the skeleton overlay.
@@ -419,7 +434,7 @@ def main():
         c2w[:3, 0] = right; c2w[:3, 1] = down; c2w[:3, 2] = forward; c2w[:3, 3] = pos
         w2c = invert_se3(c2w)
         cam = Camera(w2c=w2c, c2w=c2w, position=pos,
-                     fx=700, fy=700, cx=W/2, cy=H/2, width=W, height=H)
+                     fx=fx_render, fy=fx_render, cx=W/2, cy=H/2, width=W, height=H)
 
         # Render Gaussians with fitted SMPL pose.
         with torch.no_grad():
@@ -497,7 +512,7 @@ def main():
         c2w[:3, 0] = right; c2w[:3, 1] = down; c2w[:3, 2] = forward; c2w[:3, 3] = pos
         w2c = invert_se3(c2w)
         cam = Camera(w2c=w2c, c2w=c2w, position=pos,
-                     fx=700, fy=700, cx=W/2, cy=H/2, width=W, height=H)
+                     fx=fx_render, fy=fx_render, cx=W/2, cy=H/2, width=W, height=H)
         with torch.no_grad():
             means_p, scales_p, quats_p = skinned.deform(smpl_T)
             rgb, _, _ = render_gaussians(means_p, scales_p, quats_p, sh0, skinned.opacities,

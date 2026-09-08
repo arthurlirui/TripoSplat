@@ -170,13 +170,24 @@ def main():
     print(f"\nStep 2: Load SMPL-X + align to Gaussian cloud")
     from skinned_gaussian.smplx_model import SMPLXWrapper
     smplx = SMPLXWrapper(args.smpl_model_path, device=args.device)
-    rest_verts, _ = smplx.get_rest_mesh()
-    smpl_h = (rest_verts[:, 1].max() - rest_verts[:, 1].min()).item()
-    gs_h = (means[:, 1].max() - means[:, 1].min()).item()
-    scale = gs_h / smpl_h
     gc = means.median(0).values
+
+    # Optimize scale by minimizing Gaussian-to-SMPL surface distance.
+    from scipy.optimize import minimize_scalar
+    from scipy.spatial import cKDTree
+
+    def coverage_score(scale_val):
+        test_smplx = SMPLXWrapper(args.smpl_model_path, device=args.device)
+        test_smplx.align_to_scene(scale=scale_val, transl=gc)
+        v, _ = test_smplx.get_rest_mesh()
+        tree = cKDTree(v.cpu().numpy())
+        dists, _ = tree.query(means.cpu().numpy(), k=1)
+        return dists.mean()
+
+    result = minimize_scalar(coverage_score, bounds=(0.5, 10.0), method='bounded')
+    scale = result.x
     smplx.align_to_scene(scale=scale, transl=gc)
-    print(f"  Scale: {scale:.3f}, Centroid: {gc.tolist()}")
+    print(f"  Optimized scale: {scale:.3f} (mean_dist={result.fun:.4f}), Centroid: {gc.tolist()}")
 
     # ═══ 3. Rig Gaussians to SMPL-X ═══
     print(f"\nStep 3: Rig {len(means)} Gaussians to SMPL-X (55 joints + expression)")
