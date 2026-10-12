@@ -1,0 +1,222 @@
+\section{Method}\label{sec:method}
+
+\method{} reconstructs a skeleton-drivable 3D Gaussian avatar from a
+monocular video stream in two stages: a \emph{warm-start} that produces a
+usable drivable avatar within seconds of the first frame
+(Sec.~\ref{sec:method:warmstart}), and a \emph{continual refinement} that
+ingests subsequent clips online while mitigating catastrophic forgetting
+(Sec.~\ref{sec:method:continual}). Fig.~\ref{fig:pipeline} gives an
+overview.
+
+% ----------------------------------
+\begin{figure*}[t]
+  \centering
+  % \includegraphics[width=0.95\textwidth]{figures/pipeline.pdf}
+  \fbox{\parbox{0.93\textwidth}{\centering\vspace{1.6em}
+    \textbf{[Pipeline placeholder.]} Left: a feed-forward Gaussian
+    generator warm-starts a drivable avatar from the first frame together
+    with an SMPL registration. Right: the monocular video stream is
+    partitioned into clips; each clip triggers a continual-learning step
+    combining an EWC prior, a viewpoint-stratified replay buffer, and
+    pose-conditioned selective reactivation.
+  \vspace{1.6em}}}
+  \caption{Overview of \method{}. A drivable 3DGS avatar is warm-started
+  from the first frame and then continuously refined as the monocular
+  video stream arrives, without forgetting previously learned viewpoints.}
+  \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Preliminaries}\label{sec:method:prelim}
+A 3D Gaussian avatar is represented as a set of $N$ Gaussians, each with
+mean $\bm{\mu}\!\in\!\mathbb{R}^3$, scale $\bm{s}\!\in\!\mathbb{R}^3$ (stored
+as $\log\bm{s}$), rotation quaternion $\bm{q}\!\in\!\mathbb{R}^4$, opacity
+$o$ (stored as logit), and degree-0 spherical-harmonic color $\bm{c}$.
+Following articulated 3DGS
+avatars~\cite{hu2024gauhuman,hu2024gaussianavatar}, Gaussians are defined
+in a canonical (rest-pose) space and deformed to posed space via Linear
+Blend Skinning (LBS):
+\begin{equation}
+  \bm{G} = \sum_{k=1}^{K} w_k\, \bm{G}_k,\quad
+  \bm{\mu}^{p} = \bm{G}_{[:3,:3]}\bm{\mu}^{c} + \bm{G}_{[:3,3]},
+  \label{eq:lbs}
+\end{equation}
+where $\{w_k\}$ are per-Gaussian skinning weights to $K$ SMPL
+joints~\cite{loper2015smpl} and $\{\bm{G}_k\}$ are per-joint
+homogeneous transforms. Rotation and scale are obtained from the polar
+decomposition of $\bm{G}_{[:3,:3]}$. Rendering is performed with
+differentiable 3DGS rasterization~\cite{kerbl3Dgaussians,ye2024gsplat}.
+
+\subsection{Warm-Start: Fast Drivable Avatar from a Single Frame}\label{sec:method:warmstart}
+The warm-start yields a drivable avatar from the first frame
+$\mathcal{I}_0$ in seconds, providing a strong initialization for
+continual refinement.
+
+\textbf{Feed-forward Gaussian generation.} We apply a pre-trained
+feed-forward 3DGS generator $\mathcal{G}$ (TripoSplat~\cite{yan2026triposplat})
+to $\mathcal{I}_0$ to obtain an initial set of Gaussians
+$\{\bm{\mu}^{c}, \bm{s}, \bm{q}, o, \bm{c}\}$. Background is removed so the
+Gaussians concentrate on the subject.
+
+\textbf{Monocular SMPL registration.} A 2D pose estimator
+(YOLO11-pose~\cite{ultralytics2023yolo}) extracts keypoints from
+$\mathcal{I}_0$, and an SMPL regressor (SMPLer-X~\cite{cai2024smplerx})
+produces body shape $\bm{\beta}$, pose $\bm{\theta}_0$, and translation
+$\bm{\tau}_0$. Because a single view is ambiguous, we refine the
+registration by minimizing a combination of 2D keypoint reprojection and
+silhouette loss over a few Adam~\cite{kingma2014adam} steps:
+\begin{equation}
+  \mathcal{L}_{\mathrm{reg}} = \lambda_{\mathrm{kps}}\mathcal{L}_{\mathrm{kps}}
+    + \lambda_{\mathrm{sil}}\mathcal{L}_{\mathrm{sil}}.
+  \label{eq:reg}
+\end{equation}
+
+\textbf{Skeleton rigging.} Each Gaussian is bound to the SMPL skeleton by
+finding its $n$ nearest rest-pose mesh vertices and inheriting their
+skinning weights through a distance-softmax:
+\begin{equation}
+  w_k = \frac{\sum_{j\in\mathcal{N}(\bm{\mu}^{c})}\!\!\exp(-d_j/\tau)\,W_{jk}}
+             {\sum_{k'}\sum_{j\in\mathcal{N}(\bm{\mu}^{c})}\!\!\exp(-d_j/\tau)\,W_{jk'}},
+  \label{eq:rig}
+\end{equation}
+where $d_j$ is the distance to vertex $j$, $\tau$ a temperature, and
+$W_{jk}$ the SMPL skinning weights. The result is a drivable
+avatar $\mathcal{A}_0$ that can be posed by any SMPL parameters---the
+minimal usable asset is available immediately.
+
+\subsection{Continual Refinement over Video Streams}\label{sec:method:continual}
+We partition the remaining monocular stream into clips
+$\{\mathcal{C}_1, \mathcal{C}_2, \dots\}$ of $T$ frames each. Each clip is
+treated as a continual-learning \emph{task}: we optimize the avatar on
+$\mathcal{C}_t$ while preserving knowledge from
+$\{\mathcal{C}_1,\dots,\mathcal{C}_{t-1}\}$. For each clip we estimate
+SMPL parameters per frame (as in the warm-start), and optimize the
+canonical Gaussian parameters $\bm{\Theta}=\{\bm{\mu}^{c},\log\bm{s},\bm{q},\mathrm{logit}\,o,\bm{c}\}$
+(and optionally the skinning-weight logits) by deforming to each frame's
+pose and rendering against the observed image.
+
+\subsubsection{Base reconstruction loss}
+For a frame $\mathcal{I}$ with estimated pose $\bm{\theta}$ and camera
+$\bm{\pi}$, the rendered image $\hat{\mathcal{I}}$ is supervised with the
+standard 3DGS photometric loss:
+\begin{equation}
+  \mathcal{L}_{\mathrm{rec}} = \lambda_1 \|\hat{\mathcal{I}}-\mathcal{I}\|_1
+    + \lambda_{\mathrm{ssim}}\bigl(1-\mathrm{SSIM}(\hat{\mathcal{I}},\mathcal{I})\bigr).
+  \label{eq:rec}
+\end{equation}
+
+\subsubsection{EWC prior for Gaussian parameters}\label{sec:method:ewc}
+Naively minimizing $\mathcal{L}_{\mathrm{rec}}$ on $\mathcal{C}_t$ causes
+catastrophic forgetting of Gaussians well-constrained by earlier clips.
+Inspired by Elastic Weight Consolidation~\cite{kirkpatrick2017overcoming},
+we estimate, after finishing clip $\mathcal{C}_{t-1}$, a per-parameter
+importance $F_i$ as the empirical Fisher information, \ie{} the squared
+gradient of $\mathcal{L}_{\mathrm{rec}}$ accumulated over the clip's frames
+and over a small held-out replay subset:
+\begin{equation}
+  F_i \leftarrow \gamma\, F_i + (1-\gamma)\,
+  \frac{1}{|\mathcal{C}_{t-1}|}\sum_{\mathcal{I}\in\mathcal{C}_{t-1}}
+  \Bigl(\partial_{\Theta_i}\mathcal{L}_{\mathrm{rec}}\Bigr)^{2},
+  \label{eq:fisher}
+\end{equation}
+where $\gamma\!\in\![0,1]$ is a forgetting factor for the running
+importance and $\Theta_i$ denotes a single scalar parameter. The
+importance $F_i$ is large for parameters that strongly affect the
+rendering of previously observed viewpoints---typically Gaussians that are
+visible and well-constrained in those views. When learning from the new
+clip $\mathcal{C}_t$, we add a quadratic penalty anchoring parameters to
+their post-$\mathcal{C}_{t-1}$ values $\Theta^{\star}_i$:
+\begin{equation}
+  \mathcal{L}_{\mathrm{ewc}} = \sum_{i} \tfrac{1}{2}\, F_i\,(\Theta_i - \Theta^{\star}_i)^{2}.
+  \label{eq:ewc}
+\end{equation}
+Because $F_i$ is defined per Gaussian attribute, the penalty acts
+spatially: it protects well-observed body regions (high $F_i$) while
+leaving under-observed ones (low $F_i$) free to update, naturally
+allocating the model's plasticity to where new evidence arrives.
+
+\subsubsection{Viewpoint-stratified replay buffer}\label{sec:method:replay}
+EWC alone is a soft constraint and can still drift over many clips. We
+complement it with an episodic-memory replay buffer $\mathcal{B}$ that
+stores a compact, pose-diverse set of historical frames. To keep $\mathcal{B}$
+representative of the articulated body's viewpoint distribution, we
+stratify by SMPL global orientation: frames are binned by the azimuth of
+the root pose, and within each bin a fixed quota is retained using a
+coverage-greedy selection that maximizes the minimum feature distance to
+already-buffered frames (herding~\cite{rebuffi2017icarl}). At each
+optimization step on $\mathcal{C}_t$, we additionally render and supervise
+a small batch sampled from $\mathcal{B}$, yielding a replay loss
+$\mathcal{L}_{\mathrm{rb}}$ with the same form as
+Eq.~\eqref{eq:rec}. This directly re-exposes the optimizer to earlier
+viewpoints and provides a stronger anti-forgetting signal than the
+parameter-space EWC prior.
+
+\subsubsection{Pose-conditioned selective reactivation}\label{sec:method:react}
+Streaming clips are pose-biased: a clip may show only the upper body, the
+back, or a particular garment region. To use the optimization budget
+efficiently and avoid densifying already-well-covered regions, we employ
+a selective reactivation policy. For each Gaussian we maintain an
+accumulated visibility count $v_i$ over observed frames. During the
+densification phase of 3DGS~\cite{kerbl3Dgaussians}, candidates for
+clone/split are filtered so that Gaussians in body regions whose SMPL
+joints have low historical visibility are prioritized; regions with high
+$v_i$ are pruned more aggressively. Concretely, we modulate the
+densification gradient threshold per Gaussian by
+\begin{equation}
+  g_i = g_0 \cdot \bigl(1 + \rho\, \bar{v}_i\bigr),
+  \label{eq:react}
+\end{equation}
+where $\bar{v}_i$ is the normalized visibility and $\rho$ controls the
+strength. This raises the split/clone bar for frequently seen Gaussians
+and lowers it for under-observed ones, steering capacity toward novel
+detail as the stream progresses.
+
+\subsubsection{Overall objective}
+The total loss during clip $\mathcal{C}_t$ is
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_{\mathrm{rec}}(\mathcal{C}_t)
+              + \lambda_{\mathrm{ewc}}\mathcal{L}_{\mathrm{ewc}}
+              + \lambda_{\mathrm{rb}}\mathcal{L}_{\mathrm{rb}}(\mathcal{B})
+              + \lambda_{\mathrm{w}}\mathcal{L}_{\mathrm{w}},
+  \label{eq:total}
+\end{equation}
+where $\mathcal{L}_{\mathrm{w}}$ is an optional L2 regularizer keeping
+optimizable skinning weights close to the SMPL prior~\cite{hu2024gauhuman}.
+After $\mathcal{C}_t$ is processed, the Fisher map $F_i$ (Eq.~\eqref{eq:fisher}),
+the replay buffer $\mathcal{B}$, and the visibility counts $v_i$ are
+updated, and the avatar is immediately usable for rendering and animation.
+The procedure is summarized in Algorithm~\ref{alg:continualgs}.
+
+\begin{algorithm}[t]
+\caption{\method{} continual refinement}
+\label{alg:continualgs}
+\begin{algorithmic}[1]
+\Require Warm-start avatar $\mathcal{A}_0$, stream clips $\{\mathcal{C}_t\}$
+\State Initialize Fisher map $F\!\leftarrow\!\bm{0}$, replay buffer $\mathcal{B}\!\leftarrow\!\emptyset$, visibility $v\!\leftarrow\!\bm{0}$
+\For{each clip $\mathcal{C}_t$ in the stream}
+  \State Estimate per-frame SMPL pose $\bm{\theta}$ and camera $\bm{\pi}$
+  \For{a fixed number of optimization steps}
+    \State Sample batch from $\mathcal{C}_t$ and from $\mathcal{B}$
+    \State Deform canonical Gaussians via LBS (Eq.~\eqref{eq:lbs}); render
+    \State Compute $\mathcal{L}$ (Eq.~\eqref{eq:total}) and backpropagate
+    \State Densify with pose-conditioned thresholds (Eq.~\eqref{eq:react})
+  \EndFor
+  \State Update $F$ via accumulated squared gradients (Eq.~\eqref{eq:fisher})
+  \State Update $\mathcal{B}$ via viewpoint-stratified herding
+  \State Update visibility counts $v$; emit drivable avatar $\mathcal{A}_t$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Discussion}\label{sec:method:discussion}
+\method{} decouples \emph{availability} from \emph{fidelity}: the
+warm-start avatar is drivable immediately, and each subsequent clip
+improves a specific aspect of the body under the protection of the EWC
+prior and replay buffer. The design is orthogonal to the choice of
+feed-forward generator and SMPL regressor, so improvements in either
+component directly benefit \method{}. Compared with streaming 3DGS
+methods~\cite{wu2025streamsplat,li2025streamgs} that do not model
+articulated structure, our skeleton-conditioned deformation ensures the
+avatar remains drivable throughout; compared with per-video
+optimizers~\cite{hu2024gauhuman,hu2024gaussianavatar,qian2024gsavatar},
+the continual-learning formulation enables online, incremental consumption
+of footage without retraining.

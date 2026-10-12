@@ -1,0 +1,28 @@
+\section{Conclusion}\label{sec:conclusion}
+
+We presented \method{}, a framework that unifies feed-forward generation
+and per-video optimization for monocular drivable 3DGS avatars through a
+continual-learning formulation. A warm-start produces a drivable avatar
+within seconds of the first frame; as the monocular video streams in,
+\method{} continuously refines the avatar while mitigating catastrophic
+forgetting via an EWC prior on Gaussian parameters, a viewpoint-stratified
+replay buffer, and pose-conditioned selective reactivation. Experiments
+show that \method{} approaches the fidelity of offline optimizers, is
+available almost instantly, and preserves earlier-viewpoint quality far
+better than naive sequential fine-tuning.
+
+\textbf{Limitations and future work.} SMPL registration from monocular
+video remains a source of error for loose clothing and fast motion; a
+learned, uncertainty-aware registration could further improve robustness.
+Extending the continual-learning formulation to SMPL-X with facial and
+hand articulation, and to multi-subject scenes, are natural next steps.
+We also see promise in adapting more advanced continual-learning
+algorithms---such as gradient-projection methods---to the 3DGS setting.
+
+\section*{Ethical Considerations}
+\method{} reconstructs photorealistic human avatars from monocular video.
+Such technology carries risks of misuse including the creation of
+non-consensual synthetic content. We commit to releasing the method with
+documentation of these risks and support for provenance/watermarking of
+generated avatars, and we encourage downstream applications to obtain
+explicit subject consent.

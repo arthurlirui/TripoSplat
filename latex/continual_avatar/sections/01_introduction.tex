@@ -1,0 +1,69 @@
+\section{Introduction}\label{sec:intro}
+
+Photorealistic and animatable digital humans are a cornerstone of modern
+multimedia, powering virtual production, immersive telepresence, augmented
+reality try-on, and interactive gaming. A long-standing goal in this domain
+is to create such avatars from the most ubiquitous capture modality---a
+single monocular RGB video---without requiring a calibrated multi-view
+studio. Recent progress on 3D Gaussian Splatting (3DGS)~\cite{kerbl3Dgaussians}
+and on feed-forward 3D generation has brought this goal within reach, yet a
+satisfactory solution that is simultaneously \emph{fast}, \emph{drivable},
+and \emph{incrementally refinable} remains elusive.
+
+Existing methods cluster into two paradigms with complementary strengths.
+\textbf{Feed-forward generators}~\cite{yan2026triposplat,tang2024lgm,zhang2024gslrm,pan2024humansplat,qiu2025lhm}
+map one or a few posed images to a set of 3D Gaussians in a single forward
+pass, producing a usable asset in seconds. Their accuracy on unseen regions
+and fine appearance detail is, however, fundamentally bounded by the
+generalization capacity of the generator. \textbf{Per-video optimizers}
+based on deformable or articulated 3DGS~\cite{hu2024gauhuman,hu2024gaussianavatar,qian2024gsavatar,kocabas2024hugs}
+fit an avatar to an entire monocular sequence through gradient descent,
+attaining high fidelity but requiring tens of minutes of offline training
+and, crucially, treating the video as a closed dataset: once optimized, the
+model cannot ingest additional footage without retraining from scratch.
+The recently emerging line of streaming 3DGS~\cite{wu2025streamsplat,li2025streamgs,girish2024queen}
+reconstructs general scenes online, but does not target the articulated,
+skeleton-drivable human setting nor explicitly address the catastrophic
+forgetting that arises when an avatar optimized on one set of viewpoints is
+later exposed to new ones.
+
+This gap motivates a key question: \emph{can we obtain a drivable avatar
+within seconds of the first frame and then continuously improve its detail
+as the monocular video streams in, without forgetting what was already
+learned?} Naively sequential fine-tuning on streaming clips fails at this
+goal: new observations overwrite earlier ones, and the avatar degrades on
+previously well-reconstructed viewpoints---the well-known catastrophic
+forgetting phenomenon, now manifest in the geometry and appearance of 3D
+Gaussians rather than classifier weights.
+
+We address this problem by casting monocular avatar reconstruction as a
+\textbf{continual-learning} problem over 3DGS parameters. Our framework,
+\method{}, makes the following contributions:
+
+\begin{itemize}
+    \item \textbf{A unified warm-start \& continual-refinement pipeline.}
+          \method{} bootstraps a drivable 3DGS avatar from a single frame
+          via a feed-forward Gaussian generator and an SMPL-based skeleton
+          registration, then refines it continuously as monocular clips
+          arrive. To our knowledge this is the first framework to
+          explicitly connect continual learning with drivable 3DGS human
+          avatars.
+    \item \textbf{An EWC prior for 3D Gaussian parameters.} We estimate a
+          per-Gaussian Fisher information importance map and regularize
+          updates of important parameters when learning from new clips,
+          preserving previously acquired detail without freezing the model.
+    \item \textbf{A viewpoint-stratified replay buffer} that stores a
+          compact, pose-diverse set of historical frames and re-renders
+          them jointly with incoming data, providing episodic-memory
+          replay adapted to the articulated structure of the human body.
+    \item \textbf{Pose-conditioned selective reactivation} that focuses
+          densification and optimization budget on body regions that are
+          under-observed in the current pose, improving sample efficiency
+          on streaming data.
+\end{itemize}
+
+Experiments on monocular human video benchmarks show that \method{}
+approaches the fidelity of offline optimizers while consuming the video
+online, and that its continual-learning components reduce forgetting of
+early viewpoints by a large margin compared to naive sequential
+fine-tuning. We release code to support reproducible research.

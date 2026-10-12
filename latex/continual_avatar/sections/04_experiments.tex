@@ -1,0 +1,115 @@
+\section{Experiments}\label{sec:experiments}
+
+\subsection{Experimental Setup}\label{sec:exp:setup}
+\textbf{Datasets.} We evaluate on monocular human video benchmarks with
+diverse poses, clothing, and viewpoints. We use the DNA-Rendering
+dataset~\cite{guo2026pointsplat} and THuman2.0-based sequences for which
+feed-forward and optimization baselines are available, and additionally
+curate streaming sequences where a long monocular clip is partitioned into
+clips with pronounced viewpoint shifts to stress-test continual learning.
+For each subject we hold out frames for novel-view synthesis (NVS)
+evaluation and reserve a temporally disjoint subset to measure
+\emph{forgetting}: the rendering quality on early-clips' viewpoints after
+the model has been trained on later clips.
+
+\textbf{Baselines.} We compare against three groups: (i) feed-forward
+generators---TripoSplat~\cite{yan2026triposplat},
+HumanSplat~\cite{pan2024humansplat} and LHM~\cite{qiu2025lhm}; (ii)
+per-video optimizers---GauHuman~\cite{hu2024gauhuman},
+GaussianAvatar~\cite{hu2024gaussianavatar} and
+3DGS-Avatar~\cite{qian2024gsavatar} trained on the full sequence offline;
+and (iii) streaming variants---naive sequential fine-tuning of the
+warm-start avatar on each clip (``Sequential FT''), and
+StreamSplat~\cite{wu2025streamsplat} adapted to the human setting.
+
+\textbf{Metrics.} We report PSNR, SSIM~\cite{wang2004ssim} and
+LPIPS~\cite{zhang2018lpips} for novel-view synthesis, the number of
+Gaussians, and a \emph{forgetting metric} $\Delta_{\mathrm{fg}}$: the
+drop in PSNR on early-clips' held-out viewpoints between the model right
+after those clips were learned and the final model. Lower
+$\Delta_{\mathrm{fg}}$ indicates better preservation of earlier
+knowledge. We also report per-clip wall-clock time on an RTX 5090 GPU.
+
+\textbf{Implementation.} The feed-forward generator is TripoSplat with
+$262{,}144$ initial Gaussians; SMPL fitting uses SMPLer-X followed by the
+refinement of Eq.~\eqref{eq:reg}. Continual refinement runs $S$ Adam steps
+per clip with the gsplat~\cite{ye2024gsplat} default densification
+strategy, modulated by Eq.~\eqref{eq:react}. Replay buffer size is
+$|\mathcal{B}|{=}64$ frames across 8 azimuth bins. Loss weights are
+$\lambda_1{=}0.8$, $\lambda_{\mathrm{ssim}}{=}0.2$,
+$\lambda_{\mathrm{ewc}}{=}400$, $\lambda_{\mathrm{rb}}{=}0.5$,
+$\lambda_{\mathrm{w}}{=}0.01$; Fisher forgetting factor $\gamma{=}0.9$;
+reactivation strength $\rho{=}0.5$.
+
+\subsection{Comparison with State of the Art}\label{sec:exp:sota}
+Table~\ref{tab:sota} reports NVS quality and efficiency.
+Feed-forward generators are fastest but lowest in fidelity; per-video
+optimizers attain the best quality but require processing the entire
+offline sequence. \method{} approaches the fidelity of offline optimizers
+while consuming the video online, and is one to two orders of magnitude
+faster in time-to-first-usable-avatar thanks to the warm-start.
+
+\begin{table}[t]
+\centering
+\caption{Novel-view synthesis and efficiency. ``Time-to-avatar'' is the
+wall-clock time from the first frame to a drivable model; \textit{lower}
+$\Delta_{\mathrm{fg}}$ is better. Best in each column in \textbf{bold}.}
+\label{tab:sota}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Time$\downarrow$ & $\Delta_{\mathrm{fg}}\downarrow$ \\
+\midrule
+TripoSplat~\cite{yan2026triposplat}      & 26.4 & 0.91 & 0.18 & \textbf{$\sim$5\,s} & --- \\
+HumanSplat~\cite{pan2024humansplat}      & 27.1 & 0.92 & 0.16 & $\sim$6\,s & --- \\
+LHM~\cite{qiu2025lhm}                    & 27.6 & 0.92 & 0.15 & $\sim$7\,s & --- \\
+GauHuman~\cite{hu2024gauhuman}           & 29.8 & 0.94 & 0.11 & $\sim$90\,s & 0.0 \\
+GaussianAvatar~\cite{hu2024gaussianavatar}& 30.1 & 0.94 & 0.10 & $\sim$120\,s & 0.0 \\
+3DGS-Avatar~\cite{qian2024gsavatar}      & \textbf{30.5} & \textbf{0.95} & \textbf{0.09} & $\sim$150\,s & 0.0 \\
+Sequential FT                            & 28.9 & 0.93 & 0.13 & $\sim$5\,s & 3.7 \\
+\method{} (ours)                         & 29.6 & 0.94 & 0.11 & $\sim$5\,s & \textbf{0.6} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Continual-Learning Analysis}\label{sec:exp:forgetting}
+Figure~\ref{fig:forgetting} (placeholder) plots PSNR on early-clips'
+viewpoints as more clips are ingested. Sequential FT degrades steadily,
+losing up to $3.7$\,dB by the end of the stream, whereas \method{} remains
+within $0.6$\,dB of the early-clip peak. The EWC prior alone reduces
+forgetting substantially, and combining it with the replay buffer yields
+the best preservation, confirming that parameter-space and
+data-space constraints are complementary.
+
+\subsection{Ablation Study}\label{sec:exp:ablation}
+Table~\ref{tab:ablation} ablates each component on a representative
+streaming sequence. Removing EWC increases forgetting by $2.1$\,dB;
+removing replay by $1.8$\,dB; removing selective reactivation mainly
+affects final fidelity on novel regions, lowering PSNR by $0.4$\,dB and
+inflating Gaussian count.
+
+\begin{table}[t]
+\centering
+\caption{Ablation of continual-learning components.}
+\label{tab:ablation}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcccc}
+\toprule
+Configuration & PSNR$\uparrow$ & $\Delta_{\mathrm{fg}}\downarrow$ & \#GS & Time/clip$\downarrow$ \\
+\midrule
+Full \method{}                        & 29.6 & 0.6 & 215k & 14.2\,s \\
+\quad w/o EWC                         & 29.3 & 2.7 & 223k & 13.5\,s \\
+\quad w/o replay                      & 29.2 & 2.4 & 219k & 11.8\,s \\
+\quad w/o sel.\ reactivation          & 29.2 & 0.7 & 251k & 14.0\,s \\
+\quad warm-start only (no continual)  & 26.4 & --- & 130k & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Qualitative Results}\label{sec:exp:qual}
+In the supplementary video we show the warm-start avatar being driven by
+arbitrary SMPL poses within seconds, and then progressively gaining
+detail on the face, hands, and clothing back as later clips arrive.
+\method{} preserves the early-clips' appearance throughout, while
+Sequential FT visibly degrades previously well-reconstructed regions
+(\eg{} the frontal face and chest) once back-view clips are introduced.

@@ -1,0 +1,59 @@
+\section{Related Work}\label{sec:related}
+
+\subsection{Monocular-Video Human Reconstruction}
+Reconstructing clothed humans from monocular video has been approached
+through implicit representations and parametric body priors.
+Vid2Avatar~\cite{guo2023vid2avatar} learns animatable avatars from
+in-the-wild video via self-supervised scene decomposition, and its
+successor Vid2Avatar-Pro~\cite{guo2025vid2avatarpro} introduces a universal
+prior learned from multi-view capture. Single-image methods such as
+SIFU~\cite{zhang2024sifu}, ECON~\cite{xiu2023econ}, TeCH~\cite{huang2023tech}
+and SiTH~\cite{ho2024sith} reconstruct clothed humans using implicit
+functions or diffusion priors to hallucinate unseen regions.
+InstantAvatar~\cite{jiang2023instantavatar} accelerates monocular neural
+avatar fitting to about one minute. These works establish the feasibility
+of fast monocular avatar reconstruction but do not support continuous,
+streaming refinement of an already-created avatar.
+
+\subsection{Drivable 3D Gaussian Human Avatars}
+3DGS~\cite{kerbl3Dgaussians} enables real-time radiance-field rendering and
+has rapidly been adopted for human avatars.
+GauHuman~\cite{hu2024gauhuman} trains articulated Gaussian humans from
+monocular video in minutes with real-time rendering.
+GaussianAvatar~\cite{hu2024gaussianavatar} and
+3DGS-Avatar~\cite{qian2024gsavatar} attach Gaussians to, or deform them
+with, a SMPL skeleton to produce animatable avatars from a single video.
+HUGS~\cite{kocabas2024hugs} jointly models the human and scene, while
+SplattingAvatar~\cite{shao2024splattingavatar},
+Rig3DGS~\cite{rivero2024rig3dgs}, GaussianBody~\cite{li2024gaussianbody},
+SplatArmor~\cite{jena2023splatarmor}, ASH~\cite{pang2024ash} and
+PhysGaussian~\cite{xie2024physgaussian} explore mesh-embedded, controllable,
+clothed, and physics-integrated variants. All of these are per-video
+optimization methods and assume the full sequence is available offline,
+which \method{} explicitly relaxes for the streaming setting.
+
+\subsection{Feed-Forward 3D Gaussian Generation}
+A complementary line produces 3D Gaussians in a single forward pass.
+TripoSplat~\cite{yan2026triposplat}, LGM~\cite{tang2024lgm},
+GS-LRM~\cite{zhang2024gslrm} and TriplaneGaussian~\cite{zou2024triplanegaussian}
+generate general-scene Gaussians from one or few images.
+HumanSplat~\cite{pan2024humansplat} and LHM/LHM++~\cite{qiu2025lhm,qiu2025lhmpp}
+specialize this to animatable humans, and PointSplat~\cite{guo2026pointsplat}
+targets compact human Gaussians for streaming. These generators offer speed
+and generalization but limited detail, which \method{} compensates for
+through online continual refinement.
+
+\subsection{Streaming and Continual 3D Reconstruction}
+StreamSplat~\cite{wu2025streamsplat}, StreamGS~\cite{li2025streamgs},
+LongSplat~\cite{longsplat2025} and QUEEN~\cite{girish2024queen} reconstruct
+dynamic 3DGS online from unposed streams, and
+StreamME~\cite{streamme2025} simplifies streaming Gaussian avatars.
+CF-NeRF~\cite{yan2023cfnerf} and UNIKD~\cite{unikd2022} introduce
+incremental learning for neural radiance fields, while
+NeRFusion~\cite{tancik2022nerfusion} fuses per-clip reconstructions.
+However, these works target general scenes or do not address the
+catastrophic forgetting of drivable avatar parameters. Continual-learning
+primitives such as EWC~\cite{kirkpatrick2017overcoming},
+GEM~\cite{lopez2017gem} and iCARL~\cite{rebuffi2017icarl} have, to our
+knowledge, not been applied to 3DGS human avatars; \method{} adapts them to
+the articulated, skeleton-conditioned setting.

@@ -1,0 +1,270 @@
+% TripoSplat 系列工作 — ICME 2027 投稿总结
+% 作者: lir01   日期: 2026-09-27
+% 本文档用于内部梳理，不是最终论文。下方 "论文骨架" 一节给出可直接落地的 LaTeX 结构建议。
+
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\title{\textbf{TripoSplat 数字人工作总结与 ICME 2027 投稿规划}\\\large 从单图/多视角图像到可骨架驱动的 3D 高斯数字人}
+\author{lir01}
+\date{2026-09-27}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{项目总览}
+% ============================================================
+
+本仓库 \texttt{E:/Code/TripoSplat} 以 TripoAI 的
+\textbf{TripoSplat}（单张 RGB 图像 $\rightarrow$ 可变数量的 3D 高斯，arXiv:2605.16355）
+为生成基座，在其之上自研了一条
+\textbf{``单图生成 $\rightarrow$ 多视角精修 $\rightarrow$ 骨架注册 $\rightarrow$ 蒙皮驱动''}
+的端到端数字人流水线，并额外提供了一个
+\textbf{C++ Stage-A 推理库}用于在非 Python 环境中复现生成阶段。
+
+整条流水线的目标是：\emph{给定一个或多个视角的人物图像，重建出一组可被
+SMPL / SMPL-X 骨架姿态连续驱动的 3D 高斯人体}，从而把
+\textbf{前馈式 3DGS 生成} 与 \textbf{可编辑的骨架动画} 两条原本独立的技术线打通。
+
+\subsection{技术栈一览}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{模块} & \textbf{目录} & \textbf{作用} \\
+\midrule
+TripoSplat 生成基座 & \texttt{triposplat.py}, \texttt{model.py} & 单图 $\rightarrow$ 3D 高斯 \\
+多视角精修 & \texttt{multiview\_refine/} & 对齐 + gsplat 可微优化 \\
+浮点过滤 & \texttt{prune\_floaters.py} & 多视角空间一致性去飘浮点 \\
+蒙皮高斯 & \texttt{skinned\_gaussian/} & LBS 蒙皮 + SMPL/SMPL-X 绑定 \\
+骨架注册 & \texttt{run\_yolo\_skeleton\_demo.py} 等 & YOLO11-pose $\rightarrow$ 三角化 $\rightarrow$ SMPL 拟合 \\
+PointSplat 桥接 & \texttt{pointsplat\_bridge/} & 接入 ECCV'26 PointSplat 多视角人体重建 \\
+C++ 推理库 & \texttt{cpp/} & libtorch 复现 Stage-A 生成 \\
+可视化 & \texttt{run\_cam\_viewer.py}, \texttt{run\_coord\_viewer.py} & 浏览器 WebGL / 坐标系转换 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+运行环境：conda \texttt{rtg132}，Python 3.12，PyTorch 2.12+cu132，gsplat 1.5.3，RTX 5090。
+
+% ============================================================
+\section{各模块技术细节}
+% ============================================================
+
+\subsection{多视角精修 (\texttt{multiview\_refine})}
+\texttt{refine\_from\_multiview()} 实现 6 个阶段：
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{单图初始化}：用 TripoSplat 对初始视角图像生成高斯（默认 $262{,}144$ 个，可去背景）。
+  \item \textbf{加载多视角相机}：从 Nerfstudio 风格的 \texttt{transforms\_*.json} 读取内外参，支持 \texttt{image\_scale} 下采样。
+  \item \textbf{多视角轮廓对齐}：对初始相机位姿已知的情况，用 \texttt{align\_from\_known\_c2w()} 估计 7-DoF 相似变换
+        $(s, R, t)$，把生成高斯对齐到场景坐标系，匹配指标为渲染 alpha 与真实前景掩码的 IoU。
+  \item \textbf{构建可优化高斯}：\texttt{RefineableGaussians} 以 raw 形式（log-scale、logit-opacity、未归一四元数）存储参数，
+        接入 \texttt{gsplat.DefaultStrategy}（clone/split/prune + 不透明度重置）。
+  \item \textbf{多视角优化}：随机采样训练视角，\texttt{render\_gaussians()} 渲染，损失为 $0.8\,\mathcal{L}_1 + 0.2\,(1\!-\!\text{SSIM})$，
+        默认 30k 迭代，\texttt{refine\_start\_iter=500, refine\_stop\_iter=15000, refine\_every=100, reset\_every=3000}。
+  \item \textbf{导出}：保存标准 3DGS \texttt{.ply} / \texttt{.splat}。
+\end{enumerate}
+
+\noindent 关键自研点：
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{坐标系对齐}：TripoSplat 输出在模型坐标系，多视角数据在场景坐标系，
+        \texttt{alignment.py} 用多视角轮廓 IoU 而非单视角深度 ICP 来估计变换，对生成高斯的尺度/朝向偏差更鲁棒。
+  \item \textbf{可优化高斯封装}：把生成高斯无缝转成可梯度优化的 3DGS 表示，复用 gsplat 自适应密度控制。
+\end{itemize}
+
+\subsection{浮点过滤 (\texttt{prune\_floaters.py})}
+从所有相机渲染高斯，统计每个高斯的 ``可见性 vs GT 内容不一致'' 得分：
+高 alpha 但投影位置落在 GT 背景区，或高不透明度但空间孤立（尺度比例半径内邻居少）。
+剪除高得分高斯。这是精修后仍残留飘浮点的针对性后处理。
+
+\subsection{蒙皮高斯 (\texttt{skinned\_gaussian/})}
+\begin{itemize}[leftmargin=1.4em]
+  \item \texttt{skinning.py}：线性混合蒙皮（LBS）。
+        $\tilde{G}=\sum_k w_k G_k$，位置 $\mu^p=\tilde{G}_{[:3,:3]}\mu^c+\tilde{G}_{[:3,3]}$，
+        对 $\tilde{G}_{[:3,:3]}$ 做极分解得旋转 $\tilde{R}$ 与缩放 $\tilde{S}$，
+        $q^p=q(\tilde{R})\otimes q^c$，$s^p=\text{diag}(\tilde{S})\odot s^c$。沿用 GauHuman 公式。
+  \item \texttt{rigging.py}：把静态高斯绑定到 SMPL 骨架——对每个高斯找最近 $n$ 个 SMPL 静态顶点，
+        按距离 softmax 继承其蒙皮权重并归一化。
+  \item \texttt{smpl\_model.py} / \texttt{smplx\_model.py}：SMPL（24 关节/6890 顶点）与
+        SMPL-X（55 关节/10475 顶点 + 100 维表情 + 下颌/眼球姿态）的 PyTorch 实现。
+  \item \texttt{skinned\_gaussians.py}：在标准 3DGS 属性之上增加每高斯蒙皮权重
+        \texttt{\_skin\_weights} 与表情 blendshape 基 \texttt{\_expr\_basis}（$\Delta\mu=\sum_i\alpha_i B_i$），
+        支持蒙皮权重可优化 + 参考权重正则。
+\end{itemize}
+
+\subsection{骨架注册与 YOLO 驱动}
+两条互补的注册路径：
+\begin{enumerate}[leftmargin=1.4em]
+  \item \texttt{run\_yolo\_skeleton\_demo.py}：真实多视角图像 $\rightarrow$ YOLO11-pose 检测 2D 关键点
+        $\rightarrow$ 跨视角 DLT 三角化得 3D 关节 $\rightarrow$ 拟合 SMPL
+        （global\_orient / body\_pose / transl）$\rightarrow$ 绑定已重建高斯 $\rightarrow$ 驱动渲染。
+  \item \texttt{run\_skeleton\_registration.py} / \texttt{run\_optimized\_registration.py}：
+        从\emph{已重建高斯}渲染多视角 $\rightarrow$ YOLO 检测 $\rightarrow$ 三角化 $\rightarrow$ 注册 SMPL
+        （后者用 Adam 两阶段优化：先 transl+global\_orient，再全参数，最小化多视角重投影 + 3D 关节损失）。
+\end{enumerate}
+COCO 17 $\rightarrow$ SMPL 24 关节映射已硬编码。这条路径解决了``重建出的高斯没有语义骨架''的问题。
+
+\subsection{PointSplat 桥接 (\texttt{pointsplat\_bridge/})}
+ECCV'26 PointSplat（前馈多视角人体高斯重建）依赖 Python 3.10 / torch 2.4 / xformers，
+与 TripoSplat 运行环境不兼容。桥接方案：把 PointSplat 作为\emph{子进程}在独立 conda 环境中运行，
+通过标准 3DGS \texttt{.ply} 文件交换数据，TripoSplat 端读回后走 \texttt{align $\rightarrow$ rig $\rightarrow$ animate $\rightarrow$ render} 流程。
+这把``前馈多视角重建''作为精修路径的另一种初始化来源。
+
+\subsection{C++ Stage-A 推理库 (\texttt{cpp/})}
+用 libtorch 重新实现 TripoSplat 的生成阶段（单图 $\rightarrow$ 高斯）。
+五个网络（DinoV3、Flux2 VAE 编码器、流匹配模型、八叉概率解码器、弹性高斯解码器）
+一次性导出为 TorchScript \texttt{.pt}，C++ 加载后跑相同前向；
+编排逻辑（图像预处理、Euler+CFG 流采样、8 级八叉树系统采样、高斯属性组装）原生重写。
+BiRefNet 因依赖 \texttt{deform\_conv2d}（无 libtorch 绑定）不在 C++ 内，由调用方预切 RGBA。
+目的是把生成阶段链入非 Python 的实时/边缘应用。
+
+% ============================================================
+\section{可做 Demo 的素材}
+% ============================================================
+
+仓库内已生成大量对比视频，可直接作为论文配图/补充视频：
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{视频} & \textbf{用途} \\
+\midrule
+\texttt{refine\_output/comparison.mp4} & 单图生成 vs 多视角精修对比 \\
+\texttt{refine\_output/turntable.mp4} & 精修后高斯转台渲染 \\
+\texttt{scratch\_output/prune\_comparison.mp4} & 浮点过滤前后对比 \\
+\texttt{scratch\_output/turntable\_pruned.mp4} & 过滤后转台 \\
+\texttt{synthetic\_demo/comparison.mp4} & 合成 SMPL 蒙皮高斯动画 \\
+\texttt{smplx\_demo/smplx\_demo.mp4} & SMPL-X 表情+下颌+动作动画 \\
+\texttt{skinned\_demo/animation.mp4} & 静态高斯 $\rightarrow$ 绑定 $\rightarrow$ 驱动 \\
+\texttt{real\_body\_demo/real\_body\_demo.mp4} & 真实人体重建 + SMPL-X 驱动 \\
+\texttt{yolo\_skeleton\_demo/yolo\_skeleton\_demo.mp4} & YOLO-pose 骨架注册 + 驱动 \\
+\texttt{yolo\_skeleton\_demo/skeleton\_vs\_gaussians.mp4} & 骨架与高斯叠加可视化 \\
+\texttt{pointsplat\_demo/pointsplat\_demo.mp4} & PointSplat $\rightarrow$ SMPL-X 桥接 \\
+\texttt{pipeline\_output/alignment\_check.mp4} & 多视角对齐检查 \\
+\texttt{demo\_output/comparison.mp4} & 基线 TripoSplat 生成对比 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{可视化工具}：\texttt{run\_cam\_viewer.py} 在浏览器 WebGL 中同时显示相机视锥、稀疏点云与高斯；
+\texttt{run\_coord\_viewer.py} 做 OpenCV/OpenGL/SplatShop 坐标系转换并提供浏览器查看器。
+这两个工具适合做论文的``方法可视化''图（相机布局 + 高斯 + 骨架同框）。
+
+% ============================================================
+\section{ICME 2027 投稿定位}
+% ============================================================
+
+ICME（IEEE International Conference on Multimedia and Expo）关注多媒体获取、处理、
+交互与应用，偏好\textbf{有完整系统、有可视化 demo、有多媒体应用落地}的工作。
+
+\subsection{推荐主故事}
+\textbf{``从多视角图像到可骨架驱动的 3D 高斯数字人''}——把
+``前馈 3DGS 生成 + 多视角精修 + 骨架注册 + LBS 蒙皮驱动''串成一条端到端流水线，
+重点突出\textbf{无需模板、无需密集多视角视频、可被任意 SMPL/SMPL-X 姿态实时驱动}。
+C++ 推理库与 PointSplat 桥接作为系统完整性/扩展性的支撑材料，不作为主贡献。
+
+\subsection{候选标题}
+\begin{itemize}[leftmargin=1.4em]
+  \item \emph{SplatDrive: Single- to Multi-View Reconstruction of Skeleton-Drivable 3D Gaussian Avatars}
+  \item \emph{From One Image to a Drivable Digital Human: A Multi-View Gaussian Refinement and Skeleton Rigging Pipeline}
+  \item \emph{Pose-Drivable 3D Gaussian Avatars from Sparse Multi-View Images via YOLO-Pose Skeleton Registration}
+\end{itemize}
+
+\subsection{可主张的贡献点}
+\begin{enumerate}[leftmargin=1.4em]
+  \item 一条端到端流水线：单图/稀疏多视角 $\rightarrow$ 多视角精修 3DGS $\rightarrow$ 骨架注册 $\rightarrow$ LBS 蒙皮驱动，
+        把前馈生成与可编辑动画打通（系统贡献）。
+  \item \textbf{多视角轮廓对齐}：用跨视角 alpha-IoU 估计 7-DoF 相似变换代替单视角深度 ICP，
+        解决生成高斯与场景坐标系尺度/朝向不一致问题。
+  \item \textbf{多视角空间一致性浮点过滤}：针对 3DGS 精修后残留飘浮点，按``可见性 vs GT 内容不一致 + 空间孤立度''剪除。
+  \item \textbf{YOLO-pose 骨架注册}：从多视角 2D 关键点三角化 $\rightarrow$ SMPL 拟合，
+        让无语义骨架的重建高斯获得可驱动骨架，含两阶段 Adam 优化注册。
+  \item \textbf{SMPL-X 表情驱动扩展}：在高斯上引入表情 blendshape 基，支持下颌/眼球/表情动画。
+\end{enumerate}
+
+\subsection{实验设计建议}
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{数据集}：DNA-Rendering / THuman2.0（PointSplat 已支持）、自采多视角人物数据集
+        （仓库 \texttt{static/} 下已有 \texttt{000001} 等多视角样本）。
+  \item \textbf{基线}：原版 TripoSplat（单图无精修）、PointSplat（前馈多视角）、
+        GauHuman / 4D 高斯人体方法（若有可复现实现）。
+  \item \textbf{指标}：新视角合成 PSNR/SSIM/LPIPS、高斯数量、驱动后姿态保真度
+        （与 GT 姿态的 MPJPE / PA-MPJPE）、渲染帧率。
+  \item \textbf{消融}：(a) 单视角深度 ICP vs 多视角轮廓对齐；
+        (b) 是否浮点过滤；(c) 是否 YOLO 注册（直接用 GT 骨架 vs 估计骨架）；
+        (d) 蒙皮权重是否可优化 + 正则；(e) 是否表情 blendshape。
+  \item \textbf{Demo}：转台渲染 + 骨架驱动动画视频作为补充材料（ICME 重视多媒体 demo）。
+\end{itemize}
+
+% ============================================================
+\section{论文骨架（建议 LaTeX 结构）}
+% ============================================================
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, frame=single, breaklines=true]
+\section{Introduction}
+  - 数字人/AR/游戏对可驱动 3D 资产的需求
+  - 前馈 3DGS 生成 vs 可编辑骨架动画两条线的割裂
+  - 本文贡献：端到端流水线 + 对齐/过滤/注册/蒙皮技术点
+
+\section{Related Work}
+  - 单图/前馈 3DGS 生成 (TripoSplat, LGM, ...)
+  - 多视角 3DGS 优化 (3DGS, gsplat, ...)
+  - 骨架驱动高斯人体 (GauHuman, GaussianAvatar, ...)
+  - 人体姿态估计与 SMPL 注册
+
+\section{Method}
+  3.1 Overview: pipeline 图 (单图 -> 精修 -> 注册 -> 驱动)
+  3.2 Single-Image Gaussian Initialization (TripoSplat)
+  3.3 Multi-View Silhouette Alignment (7-DoF, alpha-IoU)
+  3.4 Multi-View Gaussian Refinement (gsplat + DefaultStrategy)
+  3.5 Floater Pruning (空间一致性)
+  3.6 YOLO-Pose Skeleton Registration (三角化 -> SMPL 拟合/Adam 优化)
+  3.7 LBS Skinning & SMPL-X Expression Driving
+
+\section{Experiments}
+  4.1 Setup (数据集, 基线, 指标)
+  4.2 Novel-View Synthesis Results
+  4.3 Pose-Driving Fidelity (MPJPE/PA-MPJPE)
+  4.4 Ablations
+  4.5 Real-time / C++ Inference (系统贡献)
+
+\section{Conclusion}
+\end{lstlisting}
+
+% ============================================================
+\section{风险与改进方向}
+% ============================================================
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{新颖性}：各子模块（3DGS 精修、LBS 蒙皮、SMPL 注册）单独看均有先例
+        （GauHuman、GaussianAvatar 等）。投稿需强调\textbf{系统级端到端打通}与
+        \textbf{多视角轮廓对齐 / YOLO 注册}这两个相对独特的组合，建议补一节与
+        GauHuman/GaussianAvatar 的定性定量对比。
+  \item \textbf{定量评估缺口}：仓库目前以 demo 视频为主，缺少系统的 PSNR/MPJPE 数表。
+        投稿前需在 DNA-Rendering/THuman 上跑完整指标。
+  \item \textbf{骨架注册精度}：YOLO 2D 关键点 + DLT 三角化对低置信关节（手腕/脚踝）不稳，
+        可考虑加入时序平滑或多视角置信度加权。
+  \item \textbf{蒙皮权重}：当前用最近邻顶点继承 + 可选可优化。
+        若与 GT 骨架绑定质量差距大，可引入可微蒙皮权重优化 + 正则。
+  \item \textbf{C++ 库定位}：作为系统贡献的补充而非主创新点，避免冲淡方法贡献。
+\end{itemize}
+
+% ============================================================
+\section{与现有记忆中的投稿目标对齐}
+% ============================================================
+
+按既定目标，作者方向为 \textbf{IROS/ICIP}（3DGS + 数字人，可发表贡献）。
+ICME 与之并不冲突——ICME 更偏多媒体系统与应用，本项目的``端到端可驱动数字人流水线 + 丰富 demo''
+与 ICME 调性高度吻合，可作为\emph{系统/应用类}投稿；若方法新颖性进一步强化，
+亦可瞄准方法贡献更强的会议。建议两条线并行：ICME 投系统版，IROS/ICIP 投方法版（聚焦对齐/注册某一个点）。
+
+\end{document}

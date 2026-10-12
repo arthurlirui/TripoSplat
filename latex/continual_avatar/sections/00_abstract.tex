@@ -1,0 +1,33 @@
+\begin{abstract}
+Reconstructing drivable digital humans from monocular video is a central
+problem in multimedia content generation, with applications in telepresence,
+virtual try-on, and interactive entertainment. Existing approaches face a
+fundamental tension: feed-forward generators produce an animatable avatar
+within seconds but suffer from limited geometric and appearance detail,
+whereas per-video optimization methods attain high fidelity yet require
+tens of minutes of offline training and cannot ingest new footage
+incrementally. Neither paradigm supports the practically desirable workflow
+of obtaining a usable avatar immediately and progressively improving it as
+more video streams in. In this paper we propose \method{}, a framework that
+unifies the two regimes through a \emph{continual-learning} formulation of
+3D Gaussian Splatting (3DGS) avatar reconstruction. \method{} warm-starts
+from a single frame using a feed-forward Gaussian generator and an
+SMPL-based skeleton registration, yielding a drivable avatar in seconds.
+It then refines the avatar continuously as a monocular video stream
+arrives, treating each incoming clip as a continual-learning task and
+mitigating catastrophic forgetting of previously observed viewpoints with
+two complementary mechanisms: an Elastic Weight Consolidation (EWC) prior
+that penalizes changes to Gaussian parameters of high Fisher-information
+importance, and a viewpoint-stratified replay buffer that periodically
+re-renders representative historical frames. A pose-conditioned selective
+reactivation strategy further focuses capacity on under-observed body
+regions. Experiments on monocular human video benchmarks demonstrate that
+\method{} matches the quality of offline optimizers while supporting online
+streaming consumption, and preserves earlier-view fidelity substantially
+better than naive sequential fine-tuning. Code will be released to
+facilitate reproducible research.
+\end{abstract}
+
+\begin{IEEEkeywords}
+3D Gaussian Splatting, digital human, monocular video reconstruction, continual learning, drivable avatar, streaming reconstruction
+\end{IEEEkeywords}
