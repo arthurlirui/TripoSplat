@@ -100,7 +100,6 @@ int main(int argc, char** argv) {
   triposplat::TripoSplatConfig cfg;
   cfg.weights_dir = args.weights_dir;
   cfg.device = torch::Device(args.device);
-  cfg.model_dtype = torch::kHalf;
 
   std::cout << "[run_example] initializing pipeline (weights=" << cfg.weights_dir
             << ", device=" << args.device << ") ...\n";

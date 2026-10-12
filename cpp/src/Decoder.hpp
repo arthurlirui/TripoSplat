@@ -18,8 +18,7 @@ namespace triposplat::detail {
 //      default coordinate transform [[1,0,0],[0,0,-1],[0,1,0]].
 class Decoder {
  public:
-  Decoder(const std::string& weights_dir, const torch::Device& device,
-          torch::ScalarType dtype);
+  Decoder(const std::string& weights_dir, const torch::Device& device);
 
   // latent: (1, q_token_length, in_channels) on the pipeline device.
   // num_gaussians: target count; rounded to a multiple of gaussians_per_point.

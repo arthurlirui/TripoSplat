@@ -230,6 +230,9 @@ __marimo__/
 /skinned_demo/
 /synthetic_demo/
 
+# YOLO model weights
+yolo*.pt
+
 # Large media files
 *.mp4
 *.gif
@@ -238,3 +241,10 @@ __marimo__/
 /.zcode/
 /real_body_demo
 /smplx_demo
+
+# Demo / debug render outputs
+/pointsplat_demo/
+/pointsplat_demo_test/
+/rigging_check/
+/skeleton_demo/
+/yolo_skeleton_demo/

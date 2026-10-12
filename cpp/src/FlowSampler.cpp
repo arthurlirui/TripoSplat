@@ -33,8 +33,7 @@ std::pair<torch::Tensor, torch::Tensor> call_flow(torch::jit::Module& flow,
 
 }  // namespace
 
-FlowSampler::FlowSampler(const std::string& weights_dir, const torch::Device& device,
-                         torch::ScalarType /*dtype*/)
+FlowSampler::FlowSampler(const std::string& weights_dir, const torch::Device& device)
     : flow_(load_module(weights_dir + "/flow_model.pt", device)),
       device_(device) {}
 

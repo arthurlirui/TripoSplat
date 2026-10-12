@@ -51,7 +51,10 @@ torch::Tensor sample_probs(const torch::Tensor& probs_in, const torch::Tensor& c
   torch::Tensor cdf = probs.cumsum(1).clamp_max(1.0 - 1e-12);
 
   // Process unique count values (Python batches the rand call per unique n).
-  auto [unique_n, inv, unique_counts] = counts.unique_consecutive(/*return_inverse=*/true);
+  // Use torch::unique (not unique_consecutive) to match Python's
+  // counts.unique(sorted=False, return_inverse=True), which collapses
+  // non-adjacent duplicates and preserves RNG draw ordering.
+  auto [unique_n, inv, unique_counts] = torch::unique(counts, /*sorted=*/false, /*return_inverse=*/true);
   (void)unique_counts;
   auto unique_acc = unique_n.accessor<int64_t, 1>();
   auto inv_acc = inv.accessor<int64_t, 1>();
@@ -88,8 +91,7 @@ torch::Tensor call_octree(torch::jit::Module& octree, const torch::Tensor& coord
 
 }  // namespace
 
-Decoder::Decoder(const std::string& weights_dir, const torch::Device& device,
-                 torch::ScalarType /*dtype*/)
+Decoder::Decoder(const std::string& weights_dir, const torch::Device& device)
     : octree_(load_module(weights_dir + "/octree.pt", device)),
       gs_(load_module(weights_dir + "/gs_decoder.pt", device)),
       device_(device) {}
@@ -117,7 +119,7 @@ torch::Tensor Decoder::octree_sample(const torch::Tensor& latent, int num_tokens
     torch::Tensor parent_coords_norm = (prev_coords_int.to(torch::kFloat32) + 0.5f) / static_cast<float>(res_p);
     torch::Tensor res_tensor = torch::full({B}, res, torch::TensorOptions().dtype(torch::kLong).device(device));
 
-    torch::Tensor pred_logits = call_octree(octree_, parent_coords_norm, res_tensor, latent, num_tensor) / 1.0f;
+    torch::Tensor pred_logits = call_octree(octree_, parent_coords_norm, res_tensor, latent, num_tensor);
     torch::Tensor pred_probs = torch::softmax(pred_logits, /*dim=*/-1);
     torch::Tensor pred_log_probs = torch::log_softmax(pred_logits, /*dim=*/-1);
 

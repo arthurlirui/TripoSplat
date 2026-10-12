@@ -92,7 +92,6 @@ The public surface is three headers under `include/triposplat/`:
 triposplat::TripoSplatConfig cfg;
 cfg.weights_dir = "cpp/weights";
 cfg.device = torch::kCUDA;
-cfg.model_dtype = torch::kHalf;
 
 triposplat::TripoSplatPipeline pipeline(cfg);
 

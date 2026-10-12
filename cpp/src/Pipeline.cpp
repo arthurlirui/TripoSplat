@@ -6,6 +6,7 @@
 #include "Preprocess.hpp"
 
 #include <torch/torch.h>
+#include <c10/util/Exception.h>  // c10::Error
 
 #include <cmath>
 #include <filesystem>
@@ -49,9 +50,9 @@ struct TripoSplatPipeline::Impl {
 
   Impl(const TripoSplatConfig& c) : cfg(c) {
     ensure_weights_dir(cfg.weights_dir);
-    encoders = std::make_unique<detail::Encoders>(cfg.weights_dir, cfg.device, cfg.model_dtype);
-    flow = std::make_unique<detail::FlowSampler>(cfg.weights_dir, cfg.device, cfg.model_dtype);
-    decoder = std::make_unique<detail::Decoder>(cfg.weights_dir, cfg.device, cfg.model_dtype);
+    encoders = std::make_unique<detail::Encoders>(cfg.weights_dir, cfg.device);
+    flow = std::make_unique<detail::FlowSampler>(cfg.weights_dir, cfg.device);
+    decoder = std::make_unique<detail::Decoder>(cfg.weights_dir, cfg.device);
   }
 };
 
@@ -71,28 +72,40 @@ Gaussian TripoSplatPipeline::run(const torch::Tensor& image,
 
   const auto& cfg = pimpl_->cfg;
   const auto& device = cfg.device;
-  auto* dec = pimpl_->decoder.get();
-  int gpp = dec->gaussians_per_point();
-  int n = validate_num_gaussians(num_gaussians, gpp);
 
-  // Seed the global CUDA generator once so the VAE's stochastic latent and the
-  // flow sampler's initial noise share one advancing stream (matches Python's
-  // single torch.Generator seeded with `seed`).
-  torch::manual_seed(seed);
+  try {
+    // Run in no-grad mode (matches Python's @torch.no_grad() on the sampler).
+    torch::NoGradGuard no_grad;
 
-  // 1. Preprocess -> (1, 3, canvas, canvas) float32 RGB on device.
-  torch::Tensor prepared = detail::preprocess_image(
-      image, remove_background, erode_radius, cfg.canvas_size, device);
+    auto* dec = pimpl_->decoder.get();
+    int gpp = dec->gaussians_per_point();
+    int n = validate_num_gaussians(num_gaussians, gpp);
 
-  // 2. Encode (DinoV3 + Flux2 VAE).
-  detail::EncodedImage enc = pimpl_->encoders->encode(prepared, seed);
+    // Seed the global CUDA generator once so the VAE's stochastic latent and the
+    // flow sampler's initial noise share one advancing stream (matches Python's
+    // single torch.Generator seeded with `seed`).
+    torch::manual_seed(seed);
 
-  // 3. Sample latent (Euler + CFG).
-  detail::SampledLatent sampled = pimpl_->flow->sample(
-      enc.feature1, enc.feature2, seed, steps, guidance_scale, shift);
+    // 1. Preprocess -> (1, 3, canvas, canvas) float32 RGB on device.
+    torch::Tensor prepared = detail::preprocess_image(
+        image, remove_background, erode_radius, cfg.canvas_size, device);
 
-  // 4. Decode -> Gaussians.
-  return dec->decode(sampled.latent, n);
+    // 2. Encode (DinoV3 + Flux2 VAE).
+    detail::EncodedImage enc = pimpl_->encoders->encode(prepared, seed);
+
+    // 3. Sample latent (Euler + CFG).
+    detail::SampledLatent sampled = pimpl_->flow->sample(
+        enc.feature1, enc.feature2, seed, steps, guidance_scale, shift);
+
+    // 4. Decode -> Gaussians.
+    return dec->decode(sampled.latent, n);
+  } catch (const TripoSplatError&) {
+    throw;  // Already the right type; re-raise as-is.
+  } catch (const c10::Error& e) {
+    throw TripoSplatError(std::string("libtorch error: ") + e.what());
+  } catch (const std::runtime_error& e) {
+    throw TripoSplatError(std::string("runtime error: ") + e.what());
+  }
 }
 
 }  // namespace triposplat

@@ -15,8 +15,7 @@ struct EncodedImage {
 // Holds the two traced encoder modules.
 class Encoders {
  public:
-  Encoders(const std::string& weights_dir, const torch::Device& device,
-           torch::ScalarType dtype);
+  Encoders(const std::string& weights_dir, const torch::Device& device);
 
   // img: (1, 3, canvas_size, canvas_size) float32 RGB in [0,1].
   // seed: passed to the VAE wrapper so the stochastic latent is reproducible.

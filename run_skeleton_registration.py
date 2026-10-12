@@ -9,10 +9,11 @@ Pipeline:
 
 Usage:
     conda activate rtg132
-    python run_skeleton_registration.py
+    python run_skeleton_registration.py [--gaussians_ply PATH] [--cameras_json PATH] \
+        [--smpl_model_path PATH]
 """
 
-import torch, sys, numpy as np, cv2, os, math
+import torch, sys, numpy as np, cv2, os, math, argparse
 sys.path.insert(0, '.')
 
 from multiview_refine.ply_io import load_gaussians_ply
@@ -55,12 +56,21 @@ def draw_skeleton(img, joints, cam, smpl_parents):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Register SMPL skeleton to Gaussian splatting body via YOLO-pose')
+    parser.add_argument('--gaussians_ply', default='scratch_output/refined_pruned.ply',
+                        help='Path to the input Gaussian PLY file')
+    parser.add_argument('--cameras_json', default='static/000001/mvs/transforms_test.json',
+                        help='Path to the Nerfstudio transforms JSON')
+    parser.add_argument('--smpl_model_path', default='E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl',
+                        help='Path to the SMPL model file')
+    args = parser.parse_args()
+
     # ═══ 1. Load Gaussians ═══
     print('=' * 60)
     print('Step 1: Load Gaussians')
     print('=' * 60)
     means, scales_raw, quats, opac_raw, sh0, shN = load_gaussians_ply(
-        'scratch_output/refined_pruned.ply', device)
+        args.gaussians_ply, device)
     opac = torch.sigmoid(opac_raw)
     colors = (sh0[:, 0, :] * SH_C0 + 0.5).clamp(0, 1)
     keep = ~((colors.max(-1).values < 0.01) & (opac > 0.5))
@@ -72,7 +82,7 @@ def main():
     print(f'\n{"=" * 60}')
     print('Step 2: Render Gaussians from 32 camera views')
     print('=' * 60)
-    cams = load_cameras('static/000001/mvs/transforms_test.json',
+    cams = load_cameras(args.cameras_json,
                         device=device, image_scale=0.5, load_image=True)
     bg = torch.zeros(3, device=device)
     rendered = []
@@ -131,7 +141,7 @@ def main():
     print(f'\n{"=" * 60}')
     print('Step 5: Register SMPL from 3D skeleton')
     print('=' * 60)
-    smpl = SMPLWrapper('E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl', device=device)
+    smpl = SMPLWrapper(args.smpl_model_path, device=device)
     rest_j = smpl.get_rest_joints().cpu().numpy()
 
     # Map COCO joints to SMPL

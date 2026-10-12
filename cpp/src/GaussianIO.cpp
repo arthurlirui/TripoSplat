@@ -209,9 +209,10 @@ bool save_ply(const std::string& path, const Gaussian& g) {
     write_f32(f, std::log(std::max(s_acc[i][1], 1e-12f)));
     write_f32(f, std::log(std::max(s_acc[i][2], 1e-12f)));
 
-    // rotation: transform the (already raw) quaternion through the default
-    // transform, then write (w, x, y, z). Python adds rots_bias (=[1,0,0,0])
-    // before transform, which is a no-op, so we transform the raw quat directly.
+    // rotation: transform the quaternion through the default transform,
+    // then write (w, x, y, z). The rots_bias [1,0,0,0] is added inside
+    // transform_quat (q_in[0] + 1.0f) before the matrix conversion, matching
+    // the Python pipeline's `_get_ply_data`.
     float q_in[4] = {q_acc[i][0], q_acc[i][1], q_acc[i][2], q_acc[i][3]};
     float q_out[4];
     transform_quat(q_in, q_out);

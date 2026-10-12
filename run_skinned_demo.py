@@ -109,8 +109,8 @@ def main():
     print(f"  SMPL scale to fit: {smpl_scale:.3f}")
 
     # Scale and translate SMPL rest mesh to match Gaussian cloud.
-    # Returns a new aligned instance; the original smpl is unchanged.
-    smpl = smpl.align_to_scene(scale=smpl_scale, transl=gc)
+    # align_to_scene modifies smpl in-place.
+    smpl.align_to_scene(scale=smpl_scale, transl=gc)
 
     skinned = rig_gaussians_to_smpl(
         means, scales_raw, quats, opacities_raw, sh0,

@@ -11,25 +11,27 @@ Pipeline:
 
 Usage:
     conda activate rtg132
-    python run_optimized_registration.py
+    python run_optimized_registration.py [--gaussians_ply PATH] [--cameras_json PATH] \
+        [--smpl_model_path PATH] [--camsys_path PATH]
 """
 
-import torch, sys, numpy as np, cv2, os, math, time
+import torch, sys, numpy as np, cv2, os, math, time, argparse
 sys.path.insert(0, '.')
-sys.path.insert(0, 'E:/Code/mmforall')
+
+# Add external camsys repo to path if not already importable.
+_camsys_default = 'E:/Code/mmforall'
+if _camsys_default not in sys.path:
+    sys.path.insert(0, _camsys_default)
 
 from multiview_refine.ply_io import load_gaussians_ply
 from skinned_gaussian.smpl_model import SMPLWrapper
 from skinned_gaussian.rigging import rig_gaussians_to_smpl
 from multiview_refine.gsplat_wrapper import render_gaussians
 from multiview_refine.cameras import load_cameras
-from camsys.smpl_forward import SMPLModel
 from ultralytics import YOLO
 
 device = 'cuda'
 SH_C0 = 0.28209479177387814
-
-# COCO 17 → SMPL 24 joint mapping
 COCO_TO_SMPL = {0:15, 5:16, 6:17, 7:18, 8:19, 9:20, 10:21, 11:1, 12:2, 13:4, 14:5, 15:7, 16:8}
 COCO_NAMES = ['nose','L_eye','R_eye','L_ear','R_ear','L_shoulder','R_shoulder',
               'L_elbow','R_elbow','L_wrist','R_wrist','L_hip','R_hip',
@@ -38,8 +40,6 @@ JN = ['pelvis','L_hip','R_hip','spine1','L_knee','R_knee','spine2',
       'L_ankle','R_ankle','spine3','L_foot','R_foot','neck','L_collar',
       'R_collar','head','L_shoulder','R_shoulder','L_elbow','R_elbow',
       'L_wrist','R_wrist','L_hand','R_hand']
-
-SMPL_MODEL_PATH = 'E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl'
 
 
 def project_joints(joints_3d, cam):
@@ -57,12 +57,28 @@ def project_joints(joints_3d, cam):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Optimized SMPL registration via multi-view reprojection minimization')
+    parser.add_argument('--gaussians_ply', default='scratch_output/refined_pruned.ply',
+                        help='Path to the input Gaussian PLY file')
+    parser.add_argument('--cameras_json', default='static/000001/mvs/transforms_test.json',
+                        help='Path to the Nerfstudio transforms JSON')
+    parser.add_argument('--smpl_model_path', default='E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl',
+                        help='Path to the SMPL model file')
+    parser.add_argument('--camsys_path', default='E:/Code/mmforall',
+                        help='Path to the external camsys repo (contains camsys.smpl_forward)')
+    args = parser.parse_args()
+
+    # Lazy-import camsys.SMPLModel from the external repo path.
+    if args.camsys_path not in sys.path:
+        sys.path.insert(0, args.camsys_path)
+    from camsys.smpl_forward import SMPLModel
+
     # ═══ 1. Load Gaussians ═══
     print('=' * 60)
     print('Step 1: Load Gaussians')
     print('=' * 60)
     means, scales_raw, quats, opac_raw, sh0, shN = load_gaussians_ply(
-        'scratch_output/refined_pruned.ply', device)
+        args.gaussians_ply, device)
     opac = torch.sigmoid(opac_raw)
     colors = (sh0[:, 0, :] * SH_C0 + 0.5).clamp(0, 1)
     keep = ~((colors.max(-1).values < 0.01) & (opac > 0.5))
@@ -74,7 +90,7 @@ def main():
     print(f'\n{"=" * 60}')
     print('Step 2: Render from 32 camera views')
     print('=' * 60)
-    cams = load_cameras('static/000001/mvs/transforms_test.json',
+    cams = load_cameras(args.cameras_json,
                         device=device, image_scale=0.5, load_image=True)
     bg = torch.zeros(3, device=device)
     rendered = []
@@ -136,7 +152,7 @@ def main():
     print('Step 5: SMPL optimization (reprojection + 3D joint loss)')
     print('=' * 60)
 
-    smpl_model = SMPLModel(SMPL_MODEL_PATH, device=device)
+    smpl_model = SMPLModel(args.smpl_model_path, device=device)
 
     # Prepare observation data for optimization.
     # Map COCO keypoints to SMPL joints.
@@ -271,7 +287,7 @@ def main():
     print('=' * 60)
 
     # Use our SMPLWrapper for rigging (same model, in-place align).
-    smpl_wrap = SMPLWrapper(SMPL_MODEL_PATH, device=device)
+    smpl_wrap = SMPLWrapper(args.smpl_model_path, device=device)
     # Get optimized SMPL posed joints from smpl_model (already in world coords).
     # The smpl_model already includes transl, so joints are in world space.
     # We need to align SMPLWrapper to the same space.

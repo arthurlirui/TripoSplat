@@ -34,11 +34,6 @@ struct TripoSplatConfig {
 
   // SH constant C0 (matches Python SH_C0 = 0.28209479177387814).
   float sh_c0 = 0.28209479177387814f;
-
-  // Optional: force a libtorch dtype for the traced modules. kHalf matches the
-  // Python fp16 inference path and is recommended. kFloat is supported as a
-  // slower, higher-precision fallback.
-  torch::ScalarType model_dtype = torch::kHalf;
 };
 
 // C++ mirror of the Python `TripoSplatPipeline` Stage-A generator.

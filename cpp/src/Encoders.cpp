@@ -42,8 +42,7 @@ torch::jit::Module load_module(const std::string& path, const torch::Device& dev
 
 }  // namespace
 
-Encoders::Encoders(const std::string& weights_dir, const torch::Device& device,
-                   torch::ScalarType /*dtype*/)
+Encoders::Encoders(const std::string& weights_dir, const torch::Device& device)
     : device_(device) {
   dinov3_ = load_module(weights_dir + "/dinov3.pt", device);
   vae_ = load_module(weights_dir + "/vae_encoder.pt", device);

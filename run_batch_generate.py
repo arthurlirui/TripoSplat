@@ -48,15 +48,10 @@ def generate_gaussians(pipe, image_path, output_ply, num_gaussians=131072):
         True if successful, False otherwise.
     """
     try:
-        from triposplat import Gaussian
         import torch
-        import numpy as np
-        import math
-
-        SH_C0 = 0.28209479177387814
 
         # Run TripoSplat.
-        gaussian, prepared = pipe.run(
+        gaussian, _ = pipe.run(
             image_path,
             num_gaussians=num_gaussians,
             remove_background=True,
@@ -74,36 +69,16 @@ def generate_gaussians(pipe, image_path, output_ply, num_gaussians=131072):
 
         N = means.shape[0]
 
-        # Build PLY.
-        from plyfile import PlyData, PlyElement
-
-        means_np = means.numpy()
-        normals = np.zeros_like(means_np)
-        f_dc = sh0[:, 0, :].numpy()  # (N, 3)
-        opac_np = opacities_raw.numpy().reshape(-1, 1)
-        scales_np = scales_raw.numpy()
-        rots_np = torch.nn.functional.normalize(quats, dim=-1).numpy()
-
-        names = ['x', 'y', 'z', 'nx', 'ny', 'nz',
-                 'f_dc_0', 'f_dc_1', 'f_dc_2',
-                 'opacity', 'scale_0', 'scale_1', 'scale_2',
-                 'rot_0', 'rot_1', 'rot_2', 'rot_3']
-
-        data = np.concatenate([
-            means_np, normals, f_dc, opac_np, scales_np, rots_np
-        ], axis=1)
-
-        dtype = [(n, 'f4') for n in names]
-        elements = np.empty(N, dtype=dtype)
-        elements[:] = list(map(tuple, data))
-
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el], byte_order='<', text=False).write(output_ply)
+        # Write PLY via the shared utility (avoids duplicating PLY logic).
+        from multiview_refine.ply_io import save_gaussians_ply
+        save_gaussians_ply(output_ply, means, scales_raw, quats, opacities_raw, sh0)
 
         return True, N
 
     except Exception as e:
+        import traceback
         print(f"    ERROR: {e}")
+        traceback.print_exc()
         return False, 0
 
 

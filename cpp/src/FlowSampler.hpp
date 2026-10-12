@@ -17,8 +17,7 @@ struct SampledLatent {
 // shift-scheduled Euler integration with classifier-free guidance.
 class FlowSampler {
  public:
-  FlowSampler(const std::string& weights_dir, const torch::Device& device,
-              torch::ScalarType dtype);
+  FlowSampler(const std::string& weights_dir, const torch::Device& device);
 
   // cond.feature1 / cond.feature2 set the condition; neg_cond is zeros.
   // Generates the initial noise with the given seed, runs `steps` Euler steps
