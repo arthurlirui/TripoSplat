@@ -30,6 +30,7 @@ from .gaussian_model import RefineableGaussians
 from .gsplat_wrapper import render_gaussians
 from .losses import compute_loss, compute_psnr
 from .alignment import estimate_similarity_transform, align_from_known_c2w
+from .differentiable_refine import refine_alignment
 
 
 def refine_from_multiview(
@@ -52,6 +53,14 @@ def refine_from_multiview(
     densify_grad_threshold: float = 0.0002,
     sh_degree: int = 0,
     save_interval: int = 1000,
+    # ── Differentiable alignment refinement (Phase 3.5) ──
+    refine_alignment_iters: int = 800,
+    refine_alignment_views: int = 8,
+    refine_alignment_lr_scale: float = 1e-2,
+    refine_alignment_lr_rotation: float = 1e-3,
+    refine_alignment_lr_translation: float = 1e-2,
+    refine_alignment_lambda_rgb: float = 1.0,
+    refine_alignment_lambda_sil: float = 0.5,
     verbose: bool = True,
 ) -> RefineableGaussians:
     """Run the full multi-view refinement pipeline.
@@ -74,6 +83,11 @@ def refine_from_multiview(
         densify_grad_threshold: Gradient threshold for clone/split.
         sh_degree: SH degree (0 = DC only).
         save_interval: Save intermediate PLY every N iterations.
+        refine_alignment_iters: Iterations for differentiable alignment refinement
+            (Phase 3.5). Set to 0 to skip. Default 800.
+        refine_alignment_views: Number of cameras rendered per refinement iteration.
+        refine_alignment_lr_*: Learning rates for scale, rotation, translation.
+        refine_alignment_lambda_*: Weights for RGB and silhouette loss terms.
         verbose: Print progress.
 
     Returns:
@@ -141,6 +155,40 @@ def refine_from_multiview(
         alpha_threshold=0.1,
         verbose=verbose,
     )
+
+    # ── Phase 3.5: Differentiable alignment refinement ──
+    if refine_alignment_iters > 0:
+        if verbose:
+            print("\n" + "-" * 60)
+            print("Phase 3.5: Differentiable alignment refinement")
+            print("  Optimise (scale, R, t) via differentiable rendering")
+            print("-" * 60)
+
+        # Extract frozen Gaussian tensors from TripoSplat output.
+        from .alignment import _tripo_gaussian_to_tensors
+        tripo_means, tripo_scales, tripo_quats, tripo_opacities, tripo_colors = \
+            _tripo_gaussian_to_tensors(tripo_gaussian, device)
+
+        scale, R, t = refine_alignment(
+            means=tripo_means,
+            scales=tripo_scales,
+            quats=tripo_quats,
+            opacities=tripo_opacities,
+            colors=tripo_colors,
+            cameras=cameras,
+            coarse_transform=(scale, R, t),
+            rmbg_fn=rmbg_fn,
+            num_iterations=refine_alignment_iters,
+            lr_scale=refine_alignment_lr_scale,
+            lr_rotation=refine_alignment_lr_rotation,
+            lr_translation=refine_alignment_lr_translation,
+            lambda_rgb=refine_alignment_lambda_rgb,
+            lambda_sil=refine_alignment_lambda_sil,
+            sh_degree=sh_degree,
+            background_color=background_color,
+            view_subset=refine_alignment_views,
+            verbose=verbose,
+        )
 
     # ── Phase 4: Create refineable Gaussians ──
     if verbose:

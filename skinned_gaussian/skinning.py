@@ -30,7 +30,7 @@ def lbs_deform_gaussians(
     scales_c: torch.Tensor,     # (N, 3) canonical activated scales
     quats_c: torch.Tensor,      # (N, 4) canonical quaternions (w,x,y,z)
     weights: torch.Tensor,      # (N, K) skinning weights, K=24
-    joint_transforms: torch.Tensor,  # (K, 4, 4) per-joint world transforms
+    joint_transforms: torch.Tensor,  # (K, 4, 4) per-joint relative transforms
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Deform canonical Gaussians to posed space via LBS.
 
@@ -39,7 +39,9 @@ def lbs_deform_gaussians(
         scales_c: (N, 3) canonical-space **activated** scales (not log).
         quats_c: (N, 4) canonical-space quaternions (will be normalized).
         weights: (N, K) skinning weights (should sum to 1 per row).
-        joint_transforms: (K, 4, 4) per-joint homogeneous world transforms.
+        joint_transforms: (K, 4, 4) per-joint **relative** transforms
+            ``T_k = G_posed_k @ G_rest_k^{-1}`` (identity at rest pose).
+            NOT absolute world transforms — see ``SMPLWrapper.get_joint_transforms``.
 
     Returns:
         means_p: (N, 3) posed-space Gaussian centres.

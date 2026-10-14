@@ -93,21 +93,60 @@ class SMPLXWrapper:
         # Alignment (for scene-space placement).
         self._align_scale = 1.0
         self._align_transl = torch.zeros(3, device=self.device)
+        self._align_rotation = None
         self._aligned = False
 
         print(f"SMPL-X loaded: {self.NUM_VERTICES} vertices, {self.NUM_JOINTS} joints, "
               f"{self.NUM_BETAS} shape, {self.NUM_EXPRESSION} expression, "
               f"{self.faces.shape[0]} faces")
 
-    def align_to_scene(self, scale: float, transl: torch.Tensor):
-        """Scale + translate to match scene coordinates."""
+    def align_to_scene(
+        self,
+        scale: float,
+        rotation: torch.Tensor | None = None,
+        transl: torch.Tensor | None = None,
+    ):
+        """Scale + rotate + translate to match scene coordinates.
+
+        Applies::
+
+            v_new = R @ (v_template * scale) + transl
+
+        ``posedirs`` is not rotated (same reasoning as SMPLWrapper).
+
+        Args:
+            scale: uniform scale factor.
+            rotation: (3, 3) rotation matrix, or ``None`` for identity
+                (backward-compatible).  Use ``coord_registry.SMPL2OPENCV`` to
+                rotate SMPL-X from Y-up to the OpenCV scene frame.
+            transl: (3,) translation, or ``None`` for zero.
+        """
         self._align_scale = scale
+        if transl is None:
+            transl = torch.zeros(3, device=self.device)
         self._align_transl = transl.to(self.device)
-        self.v_template = self.v_template * scale + self._align_transl
-        self.shapedirs_shape = self.shapedirs_shape * scale
-        self.shapedirs_expr = self.shapedirs_expr * scale
+
+        R = None
+        if rotation is not None:
+            R = rotation.to(self.device).float()
+
+        # v_template: scale, rotate, translate.
+        v_scaled = self.v_template * scale
+        if R is not None:
+            v_scaled = (R @ v_scaled.T).T
+        self.v_template = v_scaled + self._align_transl
+
+        # shapedirs_shape and shapedirs_expr: scale + rotate 3-axis.
+        for attr_name in ('shapedirs_shape', 'shapedirs_expr'):
+            sd = getattr(self, attr_name) * scale
+            if R is not None:
+                sd = torch.einsum('ij,vjd->vid', R, sd)
+            setattr(self, attr_name, sd)
+
+        self._align_rotation = R
         self._aligned = True
-        print(f"  SMPL-X aligned: scale={scale:.3f}, transl={transl.tolist()}")
+        rot_desc = f", R={'SMPL2OPENCV' if R is not None else 'I'}"
+        print(f"  SMPL-X aligned: scale={scale:.3f}, transl={self._align_transl.tolist()}{rot_desc}")
 
     def get_rest_mesh(self, betas=None, expression=None):
         """Return rest-pose vertices with shape + expression blendshapes.

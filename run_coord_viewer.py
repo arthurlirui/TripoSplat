@@ -84,6 +84,11 @@ def main():
     parser.add_argument("--world-up", choices=["x", "y", "z", "auto"], default="auto",
                         help="Source scene world-up axis. 'auto' detects it from "
                              "camera positions. Default: auto.")
+    parser.add_argument("--src-frame", choices=["auto", "opencv", "opengl"],
+                        default="opencv",
+                        help="Source world frame of the splat. 'opencv' = Y-down "
+                             "(canonical, post-refinement). 'auto' = infer from "
+                             "camera positions. Default: opencv.")
     parser.add_argument("--model-to-world", type=float, nargs=12, default=None,
                         metavar="R00 R01 R02 tx R10 R11 R12 ty R20 R21 R22 tz",
                         help="Optional 3x4 [R|t] (row-major) bringing the splat from "
@@ -118,11 +123,15 @@ def main():
     print(f"  Cameras  : {len(cameras)}")
 
     # ── Source world-up ──────────────────────────────────────────────────────
-    if args.world_up == "auto":
+    if args.src_frame == "auto" and args.world_up == "auto":
         src_up: WorldUp = detect_scene_up(cameras)
         print(f"  Detected scene up axis: {src_up!r} (override with --world-up)")
+    elif args.src_frame == "opencv":
+        src_up = "y"  # OpenCV world: Y is the vertical axis (down)
+        print(f"  Source frame: opencv (Y-down canonical)")
     else:
         src_up = args.world_up
+        print(f"  Source frame: {args.src_frame}, world up: {src_up}")
 
     model_to_world = _parse_model_to_world(args.model_to_world)
 
@@ -131,6 +140,7 @@ def main():
         means, scales_raw, quats, cameras,
         target=args.target,
         src_world_up=src_up,
+        src_frame=args.src_frame,
         model_to_world=model_to_world,
         device=args.device,
     )

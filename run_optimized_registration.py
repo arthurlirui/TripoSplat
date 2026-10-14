@@ -288,13 +288,9 @@ def main():
 
     # Use our SMPLWrapper for rigging (same model, in-place align).
     smpl_wrap = SMPLWrapper(args.smpl_model_path, device=device)
-    # Get optimized SMPL posed joints from smpl_model (already in world coords).
-    # The smpl_model already includes transl, so joints are in world space.
-    # We need to align SMPLWrapper to the same space.
-    # smpl_model's v_template is in SMPL model space; transl puts it in world.
-    # SMPLWrapper's align_to_scene does: v_template * scale + transl.
-    # Here scale=1.0 (SMPL is already at correct scale after optimization),
-    # and transl = optimized transl (which already accounts for rest pelvis offset).
+    # The optimized transl places the SMPL pelvis in the Y-up scene world
+    # frame.  SMPLWrapper's v_template is also Y-up, so no rotation is needed.
+    # align_to_scene: v_new = v_template * scale + transl (scale=1.0, R=None).
     smpl_wrap.align_to_scene(scale=1.0, transl=transl[0].detach())
 
     skinned = rig_gaussians_to_smpl(means, scales_raw, quats, opac_raw, sh0, smpl_wrap,

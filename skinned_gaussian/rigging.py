@@ -28,6 +28,11 @@ def rig_gaussians_to_smpl(
 ) -> SkinnedGaussians:
     """Bind static Gaussians to the SMPL skeleton.
 
+    **Precondition**: ``smpl.align_to_scene()`` must have been called so that
+    the SMPL rest-pose mesh is in the same coordinate frame as ``means``.
+    For Gaussians in the OpenCV scene frame (Y-down), pass
+    ``rotation=coord_registry.SMPL2OPENCV`` to ``align_to_scene``.
+
     For each Gaussian:
       1. Find the n_neighbours closest SMPL rest-pose vertices.
       2. Compute distance-based weights: w_i = exp(-dist_i / temperature).
@@ -123,6 +128,9 @@ def rig_gaussians_to_smplx(
     n_expression_bases: int = 100,
 ) -> SkinnedGaussians:
     """Bind Gaussians to SMPL-X skeleton with expression blendshape support.
+
+    **Precondition**: ``smplx.align_to_scene()`` must have been called so that
+    the SMPL-X rest-pose mesh is in the same coordinate frame as ``means``.
 
     In addition to skinning weights (55 joints), this also computes per-Gaussian
     expression displacement bases by interpolating from SMPL-X mesh vertices.

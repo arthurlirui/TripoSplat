@@ -107,6 +107,7 @@ def step2_align(args):
     from multiview_refine.cameras import load_cameras, find_camera_by_filename
     from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
     from multiview_refine.alignment import estimate_similarity_transform_multiview
+    from multiview_refine.coord_registry import MODEL2OPENCV
 
     print("=" * 60)
     print("Step 2: Align Gaussians to scene coordinate system")
@@ -124,14 +125,10 @@ def step2_align(args):
     print(f"  Init camera: cam_idx={init_cam.cam_idx}, position={init_cam.position.tolist()}")
 
     # ── Pre-transform: apply model→OpenCV rotation ──
-    # The PLY stores Gaussians in model space (Z-up). We rotate to OpenCV
-    # (Y-down, +X right, +Z forward) so the alignment module's coordinate
-    # conventions match the camera poses.
-    T_ply = torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]],
-                         dtype=torch.float32, device=args.device)
-    T_cv = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]],
-                        dtype=torch.float32, device=args.device)
-    R_model2cv = T_cv @ T_ply
+    # The PLY stores Gaussians in model space.  We rotate to the OpenCV
+    # scene frame (Y-down, +X right, +Z forward) using the centralised
+    # MODEL2OPENCV matrix from coord_registry.
+    R_model2cv = MODEL2OPENCV.to(args.device)
 
     means_cv = means @ R_model2cv.T  # rotate means to OpenCV convention
     quats_cv = quaternion_compose(rotation_matrix_to_quaternion(R_model2cv), quats)
@@ -167,9 +164,6 @@ def step2_align(args):
     quats_aligned = quaternion_compose(q_total, quats)
 
     print(f"\n  Final: scale={scale:.4f}")
-    print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
-
-    print(f"\n  Final: scale={scale:.4f}, multi-view IoU={best_iou_fine:.4f}")
     print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
 
     # Save

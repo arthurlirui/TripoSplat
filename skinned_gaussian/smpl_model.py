@@ -87,25 +87,61 @@ class SMPLWrapper:
         # Alignment transform (applied to v_template so joints match scene space).
         self._align_scale = 1.0
         self._align_transl = torch.zeros(3, device=self.device)
+        self._align_rotation = None
         self._aligned = False
 
-    def align_to_scene(self, scale: float, transl: torch.Tensor) -> None:
-        """Scale + translate this SMPL instance in-place to match the scene.
+    def align_to_scene(
+        self,
+        scale: float,
+        rotation: torch.Tensor | None = None,
+        transl: torch.Tensor | None = None,
+    ) -> None:
+        """Scale + rotate + translate this SMPL instance in-place to match the scene.
 
-        Modifies v_template and shapedirs so that get_rest_mesh(),
-        get_rest_joints(), and get_joint_transforms() all operate in the
-        scene coordinate system.
+        Applies the similarity transform::
+
+            v_new = R @ (v_template * scale) + transl
+
+        so that get_rest_mesh(), get_rest_joints(), and get_joint_transforms()
+        all operate in the scene coordinate system.
+
+        ``posedirs`` is **not** rotated: it is a function of ``(R_pose - I)``
+        and acts on ``v_shaped`` which is already in the rotated frame, so the
+        pose-blend deltas automatically follow.
 
         Args:
             scale: uniform scale factor.
-            transl: (3,) translation vector.
+            rotation: (3, 3) rotation matrix, or ``None`` for identity
+                (backward-compatible with the old scale+transl-only API).
+                Use ``coord_registry.SMPL2OPENCV`` to rotate SMPL from its
+                native Y-up frame into the OpenCV scene frame.
+            transl: (3,) translation vector, or ``None`` for zero.
         """
         self._align_scale = scale
+        if transl is None:
+            transl = torch.zeros(3, device=self.device)
         self._align_transl = transl.to(self.device)
-        self.v_template = self.v_template * scale + self._align_transl
-        self.shapedirs = self.shapedirs * scale
+
+        R = None
+        if rotation is not None:
+            R = rotation.to(self.device).float()
+
+        # v_template: (V, 3) → scale, rotate, translate.
+        v_scaled = self.v_template * scale
+        if R is not None:
+            v_scaled = (R @ v_scaled.T).T
+        self.v_template = v_scaled + self._align_transl
+
+        # shapedirs: (V, 3, D) → scale + rotate the 3-axis.
+        sd_scaled = self.shapedirs * scale
+        if R is not None:
+            sd_scaled = torch.einsum('ij,vjd->vid', R, sd_scaled)
+        self.shapedirs = sd_scaled
+
+        self._align_rotation = R
         self._aligned = True
-        print(f"  SMPL aligned: scale={scale:.3f}, transl={transl.tolist()}")
+        rot_desc = f", R={'SMPL2OPENCV' if R is not None else 'I'}"
+        print(f"  SMPL aligned: scale={scale:.3f}, transl={self._align_transl.tolist()}{rot_desc}")
 
     # ── Rest pose ──────────────────────────────────────────────────────
 

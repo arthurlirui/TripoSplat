@@ -88,11 +88,11 @@ def main():
     print("=" * 60)
     from skinned_gaussian.rigging import rig_gaussians_to_smpl
 
-    # We need to align the Gaussian coordinate system with SMPL's.
-    # SMPL rest pose is centred at origin, ~2m tall.
-    # The static Gaussians are in the scene coordinate system.
-    # For rigging, we work in the Gaussian's coordinate system directly —
-    # the SMPL mesh will be placed to match the Gaussian cloud.
+    # We need to align the SMPL model to the Gaussian coordinate system.
+    # After multi-view refinement, Gaussians are in the Y-up scene world frame
+    # (SfM produces Y-up; cameras.py converts only the camera basis to OpenCV,
+    # not the world).  SMPL's native frame is also Y-up, so no rotation is
+    # needed — only scale + translation.
     # (In a real pipeline, you'd fit SMPL to the images first, but for
     #  this demo we just use the Gaussian centroid and scale.)
 
@@ -101,6 +101,7 @@ def main():
     # Compute actual SMPL rest-pose height from the mesh bounding box.
     rest_verts, _ = smpl.get_rest_mesh()
     smpl_height = (rest_verts[:, 1].max() - rest_verts[:, 1].min()).item()
+    # Both Gaussian cloud and SMPL are Y-up, so body height is along Y.
     gs_height = (means[:, 1].max() - means[:, 1].min()).item()
     smpl_scale = gs_height / smpl_height if smpl_height > 0.01 else 1.0
 
@@ -108,8 +109,9 @@ def main():
     print(f"  Gaussian height (Y range): {gs_height:.3f}")
     print(f"  SMPL scale to fit: {smpl_scale:.3f}")
 
-    # Scale and translate SMPL rest mesh to match Gaussian cloud.
-    # align_to_scene modifies smpl in-place.
+    # Scale and translate SMPL rest mesh to match the Gaussian cloud.
+    # Both are Y-up, so no rotation is needed.  align_to_scene modifies smpl
+    # in-place.
     smpl.align_to_scene(scale=smpl_scale, transl=gc)
 
     skinned = rig_gaussians_to_smpl(

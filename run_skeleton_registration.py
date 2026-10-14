@@ -164,6 +164,8 @@ def main():
 
     smpl_scale = np.median(ratios) if ratios else 1.0
     obs_pelvis = (obs_j[1] + obs_j[2]) / 2 if valid[1] and valid[2] else obs_j[0]
+    # Both SMPL and the scene world are Y-up, so no rotation is needed.
+    # transl = obs_pelvis - rest_j[0] * scale  (rest_j[0] is the rest pelvis)
     transl = obs_pelvis - rest_j[0] * smpl_scale
 
     print(f'  Bone ratios: {[f"{r:.3f}" for r in ratios]}')

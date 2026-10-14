@@ -38,9 +38,11 @@ import torch
 
 from .cameras import Camera
 from .ply_io import save_gaussians_ply
+from .coord_registry import OPENCV2SPLATSHOP_WORLD, OPENCV2SPLATSHOP_CAM
 
 Target = Literal["opencv", "opengl", "splatshop"]
 WorldUp = Literal["x", "y", "z"]
+SrcFrame = Literal["auto", "opencv", "opengl"]
 
 # OpenGL (+X right, +Y up, -Z forward)  <->  OpenCV (+X right, +Y down, +Z forward).
 # Self-inverse: flipping Y and Z columns of the c2w works both directions.
@@ -145,7 +147,8 @@ def convert(
     cameras_cv: Sequence[Camera],
     *,
     target: Target,
-    src_world_up: WorldUp,
+    src_world_up: WorldUp = "y",
+    src_frame: SrcFrame = "auto",
     model_to_world: torch.Tensor | None = None,
     device: torch.device | str = "cpu",
 ):
@@ -159,6 +162,13 @@ def convert(
             :func:`multiview_refine.cameras.load_cameras` (OpenCV c2w).
         target:  one of ``opencv`` / ``opengl`` / ``splatshop``.
         src_world_up: which world axis is "up" in the source scene.
+            Used when ``src_frame="auto"`` or ``src_frame="opengl"``.
+            Ignored when ``src_frame="opencv"`` (world is always Y-down).
+        src_frame: explicit source world frame.  ``"opencv"`` means the
+            splat is already in the canonical OpenCV scene frame (Y-down,
+            +Z forward) — this avoids the ambiguity of ``detect_scene_up``
+            which cannot distinguish Y-up from Y-down.  ``"auto"`` uses
+            ``src_world_up`` as before.  Default ``"auto"`` (backward compat).
         model_to_world: optional (3, 4) [R|t] applied to the splat *before* the
             world-up rotation, to bring a raw model-frame splat into the scene
             world frame.  Default identity.
@@ -189,11 +199,17 @@ def convert(
     # 2. World-up rotation (only splatshop changes the world up; opencv/opengl
     #    keep the source world unchanged).
     dst_up: WorldUp = "z" if target == "splatshop" else src_world_up
-    R_w = world_up_rotation(src_world_up, dst_up).to(torch.float32)
-    if torch.allclose(R_w, torch.eye(3)):
-        R_w = torch.eye(3, dtype=torch.float32)
+    if target == "splatshop" and src_frame == "opencv":
+        # OpenCV world is Y-down; SplatShop wants Z-up.
+        # Use the centralised OPENCV2SPLATSHOP_WORLD rotation (rot_x +90°).
+        R_w = OPENCV2SPLATSHOP_WORLD.to(torch.float32)
+        means, scales, quats = _apply_transform(
+            means, scales, quats, 1.0, R_w, torch.zeros(3))
     else:
-        means, scales, quats = _apply_transform(means, scales, quats, 1.0, R_w, torch.zeros(3))
+        R_w = world_up_rotation(src_world_up, dst_up).to(torch.float32)
+        if not torch.allclose(R_w, torch.eye(3)):
+            means, scales, quats = _apply_transform(
+                means, scales, quats, 1.0, R_w, torch.zeros(3))
 
     # 3. Camera c2w: apply the same world rotation, then flip to target cam conv.
     cams_world = _apply_world_rotation_to_cameras(cameras_cv, R_w)  # OpenCV c2w, rotated world
