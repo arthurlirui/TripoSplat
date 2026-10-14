@@ -14,7 +14,7 @@ Usage:
     python prune_floaters.py \\
         --input_ply scratch_output/refined.ply \\
         --transforms static/000001/mvs/transforms_test.json \\
-        --output_ply scratch_output/refined_pruned.ply \\
+        --output_ply output/scratch_output/refined_pruned.ply \\
         --image_scale 0.5
 """
 

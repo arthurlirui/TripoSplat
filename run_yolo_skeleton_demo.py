@@ -14,7 +14,7 @@ Usage:
         --data_dir F:/Data/warm_2-mvs/000000/mvs \\
         --gaussians scratch_output/refined_pruned.ply \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl \\
-        --output_dir yolo_skeleton_demo --n_frames 240 --fps 30
+        --output_dir output/yolo_skeleton_demo --n_frames 240 --fps 30
 """
 
 import argparse
@@ -267,7 +267,7 @@ def main():
                         help='Directory with images/ and transforms_*.json')
     parser.add_argument('--gaussians', default='scratch_output/refined_pruned.ply')
     parser.add_argument('--smpl_model_path', default='E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl')
-    parser.add_argument('--output_dir', default='yolo_skeleton_demo')
+    parser.add_argument('--output_dir', default='output/yolo_skeleton_demo')
     parser.add_argument('--n_frames', type=int, default=240)
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--device', default='cuda')

@@ -11,7 +11,7 @@ Usage:
     export PYTHONUTF8=1
     python run_synthetic_demo.py \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl \\
-        --output_dir synthetic_demo \\
+        --output_dir output/synthetic_demo \\
         --n_frames 120 --fps 30
 """
 
@@ -147,7 +147,7 @@ def make_camera(smpl, device='cuda'):
 def main():
     parser = argparse.ArgumentParser(description="Synthetic skinned Gaussian demo.")
     parser.add_argument('--smpl_model_path', required=True)
-    parser.add_argument('--output_dir', default='synthetic_demo')
+    parser.add_argument('--output_dir', default='output/synthetic_demo')
     parser.add_argument('--n_gaussians', type=int, default=50000)
     parser.add_argument('--n_frames', type=int, default=120)
     parser.add_argument('--fps', type=int, default=30)

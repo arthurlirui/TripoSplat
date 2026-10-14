@@ -13,7 +13,7 @@ Usage:
         --gaussians scratch_output/refined_pruned.ply \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl \\
         --transforms static/000001/mvs/transforms_test.json \\
-        --output_dir skinned_demo \\
+        --output_dir output/skinned_demo \\
         --n_frames 120 --fps 30
 
     # With a custom pose sequence:
@@ -22,7 +22,7 @@ Usage:
         --smpl_model_path E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl \\
         --transforms static/000001/mvs/transforms_test.json \\
         --pose_file my_poses.json \\
-        --output_dir skinned_demo
+        --output_dir output/skinned_demo
 """
 
 import argparse
@@ -51,7 +51,7 @@ def main():
     parser.add_argument('--pose_file', default=None,
                         help='Path to custom pose sequence (JSON/NPZ). '
                              'If None, generates a demo pose sequence.')
-    parser.add_argument('--output_dir', default='skinned_demo')
+    parser.add_argument('--output_dir', default='output/skinned_demo')
     parser.add_argument('--n_frames', type=int, default=120)
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--image_scale', type=float, default=0.5,

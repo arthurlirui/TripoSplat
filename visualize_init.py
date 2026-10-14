@@ -18,7 +18,7 @@ Controls:
 
 Usage:
     python visualize_init.py \\
-        --ply refine_output/refined.ply \\
+        --ply output/refine_output/refined.ply \\
         --transforms static/000001/mvs/transforms_train.json \\
         --image_dir static/000001/mvs/images \\
         --image_scale 0.25
@@ -354,7 +354,7 @@ def run_gui_visualization(means, colors, opacities, cameras, image_dir, image_sc
 
     def save_screenshot(vis):
         import time
-        path = f"refine_output/screenshot_{int(time.time())}.png"
+        path = f"output/refine_output/screenshot_{int(time.time())}.png"
         vis.capture_screen_image(path)
         print(f"Saved: {path}")
         return False
@@ -374,7 +374,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Visualize initial Gaussians, camera poses, and training images."
     )
-    parser.add_argument("--ply", default="refine_output/refined.ply",
+    parser.add_argument("--ply", default="output/refine_output/refined.ply",
                         help="Path to the Gaussian PLY file.")
     parser.add_argument("--transforms", default="static/000001/mvs/transforms_train.json",
                         help="Path to transforms.json.")
@@ -385,7 +385,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--offscreen", action="store_true",
                         help="Save a rendered image instead of opening GUI.")
-    parser.add_argument("--offscreen_output", default="refine_output/visualization.png",
+    parser.add_argument("--offscreen_output", default="output/refine_output/visualization.png",
                         help="Output path for offscreen render.")
     parser.add_argument("--frustum_scale", type=float, default=0.3,
                         help="Size of camera frustums.")

@@ -14,7 +14,7 @@ Usage:
         --init_view 00.png \\
         --num_iterations 10000 \\
         --image_scale 0.5 \\
-        --output_dir scratch_output
+        --output_dir output/scratch_output
 """
 
 import argparse
@@ -71,7 +71,7 @@ def main():
     parser.add_argument('--num_iterations', type=int, default=10000)
     parser.add_argument('--image_scale', type=float, default=0.5)
     parser.add_argument('--n_init_points', type=int, default=100000)
-    parser.add_argument('--output_dir', default='scratch_output')
+    parser.add_argument('--output_dir', default='output/scratch_output')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--sh_degree', type=int, default=0)
     parser.add_argument('--save_interval', type=int, default=2000)

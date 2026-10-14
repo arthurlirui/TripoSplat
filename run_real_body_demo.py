@@ -9,7 +9,7 @@ Usage:
     python run_real_body_demo.py \\
         --gaussians scratch_output/refined_pruned.ply \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPLX/SMPLX_NEUTRAL_2020.npz \\
-        --output_dir real_body_demo --n_frames 240 --fps 30
+        --output_dir output/real_body_demo --n_frames 240 --fps 30
 """
 
 import argparse
@@ -131,7 +131,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--gaussians', default='scratch_output/refined_pruned.ply')
     parser.add_argument('--smpl_model_path', required=True)
-    parser.add_argument('--output_dir', default='real_body_demo')
+    parser.add_argument('--output_dir', default='output/real_body_demo')
     parser.add_argument('--n_frames', type=int, default=240)
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--scale_boost', type=float, default=10.0,

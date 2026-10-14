@@ -6,22 +6,22 @@ the coordinate-system alignment at each stage.
 Usage:
     # Step 1: Generate initial Gaussians from a single image
     python run_pipeline.py step1 --init_image static/000001/mvs/images/00.png \\
-        --output_dir pipeline_output --num_gaussians 131072
+        --output_dir output/pipeline_output --num_gaussians 131072
 
     # Step 2: Align (rotate + scale) the Gaussians to the scene coordinate system
     python run_pipeline.py step2 --input_ply pipeline_output/initial_gaussians.ply \\
         --transforms static/000001/mvs/transforms_train.json \\
-        --init_view 00.png --output_dir pipeline_output
+        --init_view 00.png --output_dir output/pipeline_output
 
     # Step 3: Render the aligned Gaussians from all training camera poses
     python run_pipeline.py step3 --input_ply pipeline_output/aligned_gaussians.ply \\
         --transforms static/000001/mvs/transforms_train.json \\
-        --output_dir pipeline_output --image_scale 0.5
+        --output_dir output/pipeline_output --image_scale 0.5
 
     # Run all steps in sequence
     python run_pipeline.py all --init_image static/000001/mvs/images/00.png \\
         --transforms static/000001/mvs/transforms_train.json \\
-        --init_view 00.png --output_dir pipeline_output
+        --init_view 00.png --output_dir output/pipeline_output
 """
 
 import argparse
@@ -107,7 +107,7 @@ def step2_align(args):
     from multiview_refine.cameras import load_cameras, find_camera_by_filename
     from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
     from multiview_refine.alignment import estimate_similarity_transform_multiview
-    from multiview_refine.coord_registry import MODEL2OPENCV
+    from multiview_refine.coord_registry import MODEL2SCENE
 
     print("=" * 60)
     print("Step 2: Align Gaussians to scene coordinate system")
@@ -124,20 +124,21 @@ def step2_align(args):
     init_cam = find_camera_by_filename(cameras, args.init_view)
     print(f"  Init camera: cam_idx={init_cam.cam_idx}, position={init_cam.position.tolist()}")
 
-    # ── Pre-transform: apply model→OpenCV rotation ──
-    # The PLY stores Gaussians in model space.  We rotate to the OpenCV
-    # scene frame (Y-down, +X right, +Z forward) using the centralised
-    # MODEL2OPENCV matrix from coord_registry.
-    R_model2cv = MODEL2OPENCV.to(args.device)
+    # ── Pre-transform: apply model→scene rotation ──
+    # The PLY stores Gaussians in model space (AABB [-0.5,0.5]³).  We rotate
+    # to the Y-up scene frame using MODEL2SCENE from coord_registry.  This
+    # maps (x,y,z) → (x, z, −y), putting the model in the same Y-up world
+    # frame as the SfM cameras.
+    R_model2scene = MODEL2SCENE.to(args.device)
 
-    means_cv = means @ R_model2cv.T  # rotate means to OpenCV convention
-    quats_cv = quaternion_compose(rotation_matrix_to_quaternion(R_model2cv), quats)
+    means_scene = means @ R_model2scene.T  # rotate means to Y-up scene frame
+    quats_scene = quaternion_compose(rotation_matrix_to_quaternion(R_model2scene), quats)
 
     # ── Extract init_yaw from the init camera's c2w rotation ──
     forward = init_cam.c2w[:3, 2]
     init_yaw = math.atan2(float(forward[0]), float(forward[2]))
 
-    print(f"\n  R_model2cv applied to means")
+    print(f"\n  R_model2scene applied to means (model → Y-up scene)")
     print(f"  init_yaw = {math.degrees(init_yaw):.1f}° (from c2w forward)")
 
     # ── Delegate to the shared alignment module ──
@@ -146,7 +147,7 @@ def step2_align(args):
     colors = sh0  # (N, 1, 3) SH DC
 
     scale, R, t = estimate_similarity_transform_multiview(
-        tensors=(means_cv, scales_activated, quats_cv, opacities, colors),
+        tensors=(means_scene, scales_activated, quats_scene, opacities, colors),
         cameras=cameras,
         init_yaw=init_yaw,
         alpha_threshold=0.1,
@@ -154,12 +155,12 @@ def step2_align(args):
     )
 
     # ── Apply final transform ──
-    # The alignment module returns transform relative to the OpenCV-space
-    # means.  Total: xyz_scene = scale * (R @ means_cv) + t
-    # which is equivalent to: scale * (R @ R_model2cv @ means_orig) + t
-    means_aligned = scale * (means_cv @ R.T) + t
+    # The alignment module returns transform relative to the scene-space
+    # means.  Total: xyz_scene = scale * (R @ means_scene) + t
+    # which is equivalent to: scale * (R @ R_model2scene @ means_orig) + t
+    means_aligned = scale * (means_scene @ R.T) + t
     scales_aligned_raw = scales_raw + math.log(scale)
-    R_total = R @ R_model2cv  # model → scene
+    R_total = R @ R_model2scene  # model → scene
     q_total = rotation_matrix_to_quaternion(R_total)
     quats_aligned = quaternion_compose(q_total, quats)
 
@@ -175,7 +176,7 @@ def step2_align(args):
     params = {
         'scale': float(scale), 'rotation': R_total.cpu().numpy().tolist(),
         'translation': t.cpu().numpy().tolist(),
-        'R_model2cv': R_model2cv.cpu().numpy().tolist(),
+        'R_model2scene': R_model2scene.cpu().numpy().tolist(),
         'init_yaw_deg': math.degrees(init_yaw),
         'method': 'multiview_alignment_module',
     }
@@ -276,7 +277,7 @@ def main():
 
     # Common arguments.
     def add_common_args(p):
-        p.add_argument('--output_dir', default='pipeline_output')
+        p.add_argument('--output_dir', default='output/pipeline_output')
         p.add_argument('--device', default='cuda')
 
     # Step 1.

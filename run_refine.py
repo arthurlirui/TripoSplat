@@ -8,7 +8,7 @@ Usage example:
         --init_view 00.png \\
         --num_iterations 30000 \\
         --image_scale 0.5 \\
-        --output_dir refine_output
+        --output_dir output/refine_output
 
 This runs the full pipeline:
   1. TripoSplat generates initial Gaussians from --init_view.
@@ -34,7 +34,7 @@ def main():
                         help="Path to Nerfstudio transforms_{train,val,test}.json.")
     parser.add_argument("--init_view", required=True,
                         help="Init-view image filename (e.g. 00.png).")
-    parser.add_argument("--output_dir", default="refine_output",
+    parser.add_argument("--output_dir", default="output/refine_output",
                         help="Output directory for refined PLY/SPLAT.")
 
     # TripoSplat.

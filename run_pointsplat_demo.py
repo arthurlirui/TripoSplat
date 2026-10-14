@@ -33,7 +33,7 @@ Usage
         --dataset_root third_party/pointsplat/datasets/THuman2_0_example \
         --experiment pointsplat_thuman \
         --smpl_model_path E:/Code/mmforall/model/assets/SMPLX/SMPLX_NEUTRAL_2020.npz \
-        --output_dir pointsplat_demo --n_frames 240 --fps 30
+        --output_dir output/pointsplat_demo --n_frames 240 --fps 30
 """
 
 import argparse
@@ -96,7 +96,7 @@ def main():
     )
     # SMPL-X / rendering back-end
     parser.add_argument("--smpl_model_path", required=True)
-    parser.add_argument("--output_dir", default="pointsplat_demo")
+    parser.add_argument("--output_dir", default="output/pointsplat_demo")
     parser.add_argument("--n_frames", type=int, default=240)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--device", default="cuda")

@@ -26,7 +26,7 @@ This keeps the optimisation well-conditioned: the parameters start at zero
 result, and gradients push it toward better RGB alignment.
 
 Loss = ``lambda_rgb`` * (L1 + DSSIM on rendered RGB vs. GT)
-     + ``lambda_sil`` * (BCE on rendered alpha vs. real mask)
+     + ``lambda_sil`` * (Dice loss on rendered alpha vs. real mask)
 
 Only ~500–1000 iterations are needed because the coarse alignment already
 brings the silhouettes into rough correspondence; the differentiable pass
@@ -184,13 +184,14 @@ def refine_alignment(
     coarse_transform: tuple[float, torch.Tensor, torch.Tensor],
     rmbg_fn: Callable | None = None,
     num_iterations: int = 800,
-    lr_scale: float = 1e-2,
-    lr_rotation: float = 1e-3,
-    lr_translation: float = 1e-2,
+    lr_scale: float = 5e-3,
+    lr_rotation: float = 5e-4,
+    lr_translation: float = 5e-3,
     lambda_rgb: float = 1.0,
-    lambda_sil: float = 0.5,
+    lambda_sil: float = 0.3,
     lambda_l1: float = 0.8,
     lambda_dssim: float = 0.2,
+    lambda_reg: float = 0.01,
     sh_degree: int = 0,
     background_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
     view_subset: int = 8,
@@ -201,6 +202,12 @@ def refine_alignment(
     Optimises ``(log_scale, q_delta, t_delta)`` to minimise a combined
     RGB + silhouette loss across multiple views, with Gaussian attributes
     frozen.
+
+    A regularisation term keeps the incremental parameters close to their
+    initial values (identity rotation, zero translation/scale correction),
+    preventing the optimiser from collapsing to a degenerate solution
+    (e.g. shrinking all Gaussians out of view to trivially minimise a
+    silhouette BCE).
 
     Args:
         means:     (N, 3) frozen Gaussian centres (in the coarse-aligned frame
@@ -216,8 +223,11 @@ def refine_alignment(
         num_iterations: Refinement iterations.
         lr_scale, lr_rotation, lr_translation: Learning rates.
         lambda_rgb: Weight for the RGB (L1 + DSSIM) loss term.
-        lambda_sil: Weight for the silhouette BCE loss term.
+        lambda_sil: Weight for the silhouette loss term (Dice loss).
         lambda_l1, lambda_dssim: Sub-weights within the RGB loss.
+        lambda_reg: Weight for the regularisation term that penalises
+                    deviation of (log_scale, q_delta, t_delta) from their
+                    initial values.
         sh_degree: SH degree for rendering.
         background_color: Background colour for rendering.
         view_subset: Number of cameras to render per iteration (random subset
@@ -268,6 +278,11 @@ def refine_alignment(
     n_cams = len(cameras)
     use_all = view_subset <= 0 or view_subset >= n_cams
 
+    # Initial parameter values for regularisation.
+    log_scale_init = sim.log_scale.detach().clone()
+    q_delta_init = sim.q_delta.detach().clone()    # [1, 0, 0, 0]
+    t_delta_init = sim.t_delta.detach().clone()    # [0, 0, 0]
+
     for iteration in range(1, num_iterations + 1):
         sim.train()
         optimizer.zero_grad()
@@ -299,11 +314,12 @@ def refine_alignment(
             rgb_loss = compute_loss(rgb, gt, lambda_l1=lambda_l1, lambda_dssim=lambda_dssim)
             total_rgb_loss = total_rgb_loss + rgb_loss
 
-            # Silhouette BCE loss.
+            # Silhouette loss: Dice loss (not BCE — BCE has a degenerate
+            # minimum at alpha=0 when the background dominates the image).
+            # Dice = 1 - 2*|α∩m| / (|α| + |m|)  is minimised at full overlap
+            # and has no incentive to collapse alpha to zero.
             real_mask = real_masks[ci]  # (H, W) float
-            # alpha: (1, H, W) → (H, W)
-            alpha_2d = alpha.squeeze(0)
-            # Resize alpha to match mask if needed.
+            alpha_2d = alpha.squeeze(0)  # (H, W)
             if alpha_2d.shape != real_mask.shape:
                 alpha_2d = F.interpolate(
                     alpha_2d.unsqueeze(0).unsqueeze(0),
@@ -312,15 +328,31 @@ def refine_alignment(
                     align_corners=False,
                 ).squeeze()
                 real_mask = real_mask.to(alpha_2d.device)
-            sil_loss = F.binary_cross_entropy(
-                alpha_2d.clamp(1e-6, 1 - 1e-6),
-                real_mask.to(alpha_2d.device),
-                reduction="mean",
-            )
-            total_sil_loss = total_sil_loss + sil_loss
+            intersection = (alpha_2d * real_mask).sum()
+            denom = alpha_2d.sum() + real_mask.sum() + 1e-6
+            dice_loss = 1.0 - 2.0 * intersection / denom
+            total_sil_loss = total_sil_loss + dice_loss
             n_views += 1
 
-        loss = (lambda_rgb * total_rgb_loss + lambda_sil * total_sil_loss) / max(n_views, 1)
+        # Regularisation: penalise deviation from initial parameters.
+        # For the quaternion, use the rotation-invariant geodesic distance
+        # ``1 - dot(q, q_init)^2`` instead of raw 4-vector L2, because q and
+        # −q represent the same rotation (double cover).  A naive L2 on the
+        # 4-vector would incorrectly penalise the sign-flipped identity.
+        q_delta_n = F.normalize(sim.q_delta, dim=-1)
+        q_init_n = F.normalize(q_delta_init, dim=-1)
+        quat_dist = 1.0 - (q_delta_n * q_init_n).sum() ** 2
+        reg_loss = (
+            (sim.log_scale - log_scale_init) ** 2
+            + quat_dist
+            + ((sim.t_delta - t_delta_init) ** 2).sum()
+        )
+
+        loss = (
+            lambda_rgb * total_rgb_loss
+            + lambda_sil * total_sil_loss
+            + lambda_reg * reg_loss
+        ) / max(n_views, 1)
         loss.backward()
         optimizer.step()
 
@@ -331,6 +363,7 @@ def refine_alignment(
                 f"    iter {iteration:4d}: loss={loss.item():.4f}, "
                 f"rgb={total_rgb_loss.item() / max(n_views, 1):.4f}, "
                 f"sil={total_sil_loss.item() / max(n_views, 1):.4f}, "
+                f"reg={reg_loss.item():.4f}, "
                 f"scale={s_val:.4f}"
             )
 

@@ -356,10 +356,10 @@ def main():
     cv2.putText(canvas, f'Optimized (err={np.mean(errs):.3f})', (W+10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
     cv2.putText(canvas, 'GT', (2*W+10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
 
-    os.makedirs('rigging_check', exist_ok=True)
-    cv2.imwrite('rigging_check/optimized_registration.png', canvas)
-    cv2.imwrite('rigging_check/optimized_only.png', reg_skel)
-    print(f'\nSaved rigging_check/optimized_registration.png')
+    os.makedirs('output/rigging_check', exist_ok=True)
+    cv2.imwrite('output/rigging_check/optimized_registration.png', canvas)
+    cv2.imwrite('output/rigging_check/optimized_only.png', reg_skel)
+    print(f'\nSaved output/rigging_check/optimized_registration.png')
     print(f'  Mean err: {np.mean(errs):.4f}, Max err: {np.max(errs):.4f}')
 
 

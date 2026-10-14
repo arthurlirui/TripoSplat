@@ -14,7 +14,7 @@ Usage:
     export PYTHONUTF8=1
     python run_smplx_demo.py \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPLX/SMPLX_NEUTRAL_2020.npz \\
-        --output_dir smplx_demo --n_frames 240 --fps 30
+        --output_dir output/smplx_demo --n_frames 240 --fps 30
 """
 
 import argparse
@@ -193,7 +193,7 @@ def generate_rich_poses(n_frames=240, device='cuda'):
 def main():
     parser = argparse.ArgumentParser(description="SMPL-X skinned Gaussian demo with rotating camera.")
     parser.add_argument('--smpl_model_path', required=True)
-    parser.add_argument('--output_dir', default='smplx_demo')
+    parser.add_argument('--output_dir', default='output/smplx_demo')
     parser.add_argument('--n_gaussians', type=int, default=100000)
     parser.add_argument('--n_frames', type=int, default=240)
     parser.add_argument('--fps', type=int, default=30)

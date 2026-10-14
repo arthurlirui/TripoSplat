@@ -24,7 +24,7 @@ PIPE = TripoSplatPipeline(
     device                 = "cuda",
 )
 
-OUT_ROOT     = Path("gradio_outputs").resolve()
+OUT_ROOT     = Path("output/gradio_outputs").resolve()
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 VIEWER_HTML  = Path("static/viewer/viewer.html").resolve()
 EXAMPLES_DIR = Path("static/example_inputs").resolve()

@@ -41,7 +41,7 @@ def refine_from_multiview(
     num_init_gaussians: int = 262144,
     num_iterations: int = 30000,
     image_scale: float = 0.5,
-    output_dir: str = "refine_output",
+    output_dir: str = "output/refine_output",
     seed: int = 42,
     lambda_l1: float = 0.8,
     lambda_dssim: float = 0.2,
@@ -56,11 +56,12 @@ def refine_from_multiview(
     # ── Differentiable alignment refinement (Phase 3.5) ──
     refine_alignment_iters: int = 800,
     refine_alignment_views: int = 8,
-    refine_alignment_lr_scale: float = 1e-2,
-    refine_alignment_lr_rotation: float = 1e-3,
-    refine_alignment_lr_translation: float = 1e-2,
+    refine_alignment_lr_scale: float = 5e-3,
+    refine_alignment_lr_rotation: float = 5e-4,
+    refine_alignment_lr_translation: float = 5e-3,
     refine_alignment_lambda_rgb: float = 1.0,
-    refine_alignment_lambda_sil: float = 0.5,
+    refine_alignment_lambda_sil: float = 0.3,
+    refine_alignment_lambda_reg: float = 0.01,
     verbose: bool = True,
 ) -> RefineableGaussians:
     """Run the full multi-view refinement pipeline.
@@ -184,6 +185,7 @@ def refine_from_multiview(
             lr_translation=refine_alignment_lr_translation,
             lambda_rgb=refine_alignment_lambda_rgb,
             lambda_sil=refine_alignment_lambda_sil,
+            lambda_reg=refine_alignment_lambda_reg,
             sh_degree=sh_degree,
             background_color=background_color,
             view_subset=refine_alignment_views,

@@ -145,7 +145,7 @@ def reconstruct_gaussians(
         from datetime import datetime
 
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_dir = REPO_ROOT / "pointsplat_bridge" / "runs" / ts
+        output_dir = REPO_ROOT / "output" / "pointsplat_bridge" / "runs" / ts
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

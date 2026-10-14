@@ -8,7 +8,7 @@ Usage (in the rtg132 conda env with gsplat installed):
         --init_frame 00.png \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl \\
         --clip_size 16 --steps_per_clip 500 \\
-        --output_dir continual_output
+        --output_dir output/continual_output
 
 The script (1) warm-starts a drivable avatar from the first frame via the
 TripoSplat feed-forward generator, (2) partitions the remaining frames
@@ -65,7 +65,7 @@ def main():
     ap.add_argument("--steps_per_clip", type=int, default=500)
     ap.add_argument("--num_init_gaussians", type=int, default=262144)
     ap.add_argument("--image_scale", type=float, default=0.5)
-    ap.add_argument("--output_dir", default="continual_output")
+    ap.add_argument("--output_dir", default="output/continual_output")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 

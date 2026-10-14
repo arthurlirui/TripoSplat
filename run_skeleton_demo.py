@@ -8,7 +8,7 @@ Usage:
     conda activate rtg132
     python run_skeleton_demo.py \\
         --smpl_model_path E:/Code/mmforall/model/assets/SMPLX/SMPLX_NEUTRAL_2020.npz \\
-        --output_dir skeleton_demo --n_frames 240 --fps 30
+        --output_dir output/skeleton_demo --n_frames 240 --fps 30
 """
 
 import argparse
@@ -118,7 +118,7 @@ def make_orbit_camera(centre, az, elev, radius, W, H, device='cuda', fx=700):
 def main():
     parser = argparse.ArgumentParser(description="SMPL-X skeleton motion visualization.")
     parser.add_argument('--smpl_model_path', required=True)
-    parser.add_argument('--output_dir', default='skeleton_demo')
+    parser.add_argument('--output_dir', default='output/skeleton_demo')
     parser.add_argument('--n_frames', type=int, default=240)
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--device', default='cuda')

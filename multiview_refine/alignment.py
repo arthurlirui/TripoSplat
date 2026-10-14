@@ -175,29 +175,55 @@ def _matrix_to_euler_zyx(R):
     return rx, ry, rz
 
 
+def _compute_scene_centre(cameras, real_masks):
+    """Estimate the scene centre from camera positions weighted by foreground.
+
+    Returns a (3,) tensor on the same device as the cameras.
+    """
+    positions = []
+    for cam, mask in zip(cameras, real_masks):
+        coverage = mask.mean().item()
+        if coverage > 0.02:  # at least 2% foreground
+            positions.append(cam.position.cpu().numpy())
+    if len(positions) < 2:
+        return torch.zeros(3, dtype=torch.float32, device=cameras[0].device)
+    return torch.from_numpy(np.mean(positions, axis=0)).float().to(cameras[0].device)
+
+
+def _compute_translation(gc, scale, R, scene_centre):
+    """Compute translation so that the transformed centroid lands at scene_centre.
+
+    For ``means_t = s * (R @ means) + t`` the transformed centroid is
+    ``s * (R @ gc) + t``.  Setting this equal to ``scene_centre`` gives::
+
+        t = scene_centre - s * (R @ gc)
+
+    Args:
+        gc: (3,) original Gaussian centroid (before transform).
+        scale: scalar scale factor.
+        R: (3, 3) rotation matrix.
+        scene_centre: (3,) target position in world coords.
+
+    Returns:
+        (3,) translation tensor.
+    """
+    return scene_centre - scale * (R.to(gc) @ gc)
+
+
 def _estimate_translation(means, cameras, real_masks):
     """Estimate translation t by aligning the centroid of visible Gaussians
     with the centroid of the real scene (derived from mask centroids).
 
     The real scene centre is estimated as the mean of camera positions
     weighted by mask coverage.
+
+    .. deprecated:: Kept for backward compatibility. New code should use
+       :func:`_compute_translation` which computes per-candidate translation
+       so the centroid stays at the scene centre for any (R, s).
     """
-    # Gaussian centroid (in current frame).
     gc = means.mean(dim=0)
-
-    # Scene centre: mean of camera positions that have significant foreground.
-    positions = []
-    for i, (cam, mask) in enumerate(zip(cameras, real_masks)):
-        coverage = mask.mean().item()
-        if coverage > 0.02:  # at least 2% foreground
-            positions.append(cam.position.cpu().numpy())
-    if len(positions) < 2:
-        scene_centre = np.zeros(3, dtype=np.float32)
-    else:
-        scene_centre = np.mean(positions, axis=0)
-
-    t = torch.from_numpy(scene_centre).float().to(means.device) - gc
-    return t
+    scene_centre = _compute_scene_centre(cameras, real_masks)
+    return scene_centre - gc
 
 
 def estimate_similarity_transform_multiview(
@@ -272,16 +298,22 @@ def estimate_similarity_transform_multiview(
     scale_samples = np.linspace(scale_range[0], scale_range[1], n_scale_samples)
 
     best_iou = -1.0
-    best_params = (1.0, 0.0, 0.0, 0.0, scale_range[0])  # (yaw, pitch, roll, _, scale)
+    best_params = (0.0, 0.0, 0.0, scale_range[0])  # (yaw, pitch, roll, scale)
 
-    # Initial translation: align Gaussian centroid to scene centre.
-    t_init = _estimate_translation(means, cameras, real_masks)
+    # Precompute the Gaussian centroid and scene centre once; the translation
+    # for each (R, s) candidate is derived so that the transformed centroid
+    # always lands at the scene centre.  Holding translation fixed (as the
+    # old code did) causes the centroid to drift away from the scene centre
+    # when R != I or s != 1, so the IoU evaluation measures position error
+    # rather than shape overlap — the primary cause of alignment failure.
+    gc = means.mean(dim=0)
+    scene_centre = _compute_scene_centre(cameras, real_masks)
 
     # Phase 1: Coarse yaw + scale search (pitch=0, roll=0).
     for yaw in yaw_samples:
         for s in scale_samples:
             R = _euler_to_matrix(0.0, yaw, 0.0).to(device)
-            t = t_init.to(device)
+            t = _compute_translation(gc, s, R, scene_centre)
             means_t, scales_t, quats_t = _apply_transform(means, scales, quats, s, R, t)
             # Render silhouettes for a subset of cameras (every 3rd for speed).
             subset_cams = cameras[::3]
@@ -314,7 +346,7 @@ def estimate_similarity_transform_multiview(
             for roll in roll_samples:
                 for s in scale_fine:
                     R = _euler_to_matrix(pitch, yaw, roll).to(device)
-                    t = t_init.to(device)
+                    t = _compute_translation(gc, s, R, scene_centre)
                     means_t, scales_t, quats_t = _apply_transform(means, scales, quats, s, R, t)
                     sils = _render_silhouettes(means_t, scales_t, quats_t, opacities, cameras, alpha_threshold)
                     iou = _compute_iou_batch(sils, real_masks)
@@ -328,9 +360,11 @@ def estimate_similarity_transform_multiview(
     best_yaw, best_pitch, best_roll, best_scale = best_params
     R_best = _euler_to_matrix(best_pitch, best_yaw, best_roll).to(device)
 
-    # ── Step 3: Final translation estimation ──
-    means_final = best_scale * (means @ R_best.T) + t_init.to(device)
-    t_best = _estimate_translation(means_final, cameras, real_masks)
+    # ── Step 3: Final translation ──
+    # The translation was already computed per-candidate during the search;
+    # recompute it for the best (R, s) to ensure the centroid is exactly at
+    # the scene centre.
+    t_best = _compute_translation(gc, best_scale, R_best, scene_centre)
 
     if verbose:
         print(f"  Final: yaw={math.degrees(best_yaw):.1f}°, pitch={math.degrees(best_pitch):.1f}°, "
@@ -465,12 +499,14 @@ def align_from_known_c2w(
         print(f"  tripo_extent={tripo_extent:.4f}, scene_extent={scene_extent:.4f}, scale_init={scale_init:.4f}")
 
     # ── Step 3: Derive initial translation ──
+    # The translation will be recomputed per-candidate during the search so
+    # the transformed centroid stays at the scene_centroid.  Here we just
+    # store the Gaussian centroid for later use.
     tripo_centroid = means.mean(dim=0)
     if scene_centroid is None:
         scene_centroid = torch.zeros(3, dtype=torch.float32, device=device)
     else:
         scene_centroid = scene_centroid.to(device).float()
-    t_init = scene_centroid - scale_init * (R_init.to(device) @ tripo_centroid)
 
     # ── Step 4: Extract real foreground masks ──
     if verbose:
@@ -494,7 +530,7 @@ def align_from_known_c2w(
     for yaw in yaw_samples:
         for s in scale_samples:
             R = _euler_to_matrix(0.0, yaw, 0.0).to(device)
-            t = t_init.to(device)
+            t = _compute_translation(tripo_centroid, s, R, scene_centroid)
             means_t, scales_t, quats_t = _apply_transform(means, scales, quats, s, R, t)
             sils = _render_silhouettes(means_t, scales_t, quats_t, opacities, subset_cams, alpha_threshold)
             iou = _compute_iou_batch(sils, subset_masks)
@@ -515,7 +551,7 @@ def align_from_known_c2w(
     for pitch in pitch_samples:
         for roll in roll_samples:
             R = _euler_to_matrix(pitch, best_yaw, roll).to(device)
-            t = t_init.to(device)
+            t = _compute_translation(tripo_centroid, best_scale, R, scene_centroid)
             means_t, scales_t, quats_t = _apply_transform(means, scales, quats, best_scale, R, t)
             sils = _render_silhouettes(means_t, scales_t, quats_t, opacities, subset_cams, alpha_threshold)
             iou = _compute_iou_batch(sils, subset_masks)
@@ -528,9 +564,8 @@ def align_from_known_c2w(
     best_yaw, best_pitch, best_roll, best_scale = best_params
     R_best = _euler_to_matrix(best_pitch, best_yaw, best_roll).to(device)
 
-    # ── Step 6: Final translation re-estimation ──
-    means_final = best_scale * (means @ R_best.T) + t_init.to(device)
-    t_best = _estimate_translation(means_final, cameras, real_masks)
+    # ── Step 6: Final translation ──
+    t_best = _compute_translation(tripo_centroid, best_scale, R_best, scene_centroid)
 
     if verbose:
         print(f"  Final: yaw={math.degrees(best_yaw):.1f}° pitch={math.degrees(best_pitch):.1f}° "

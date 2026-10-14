@@ -239,10 +239,10 @@ def main():
                 (W+10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
     cv2.putText(canvas, 'GT', (2*W+10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
 
-    os.makedirs('rigging_check', exist_ok=True)
-    cv2.imwrite('rigging_check/registered_skeleton.png', canvas)
-    cv2.imwrite('rigging_check/registered_only.png', reg_skel)
-    print(f'\nSaved rigging_check/registered_skeleton.png')
+    os.makedirs('output/rigging_check', exist_ok=True)
+    cv2.imwrite('output/rigging_check/registered_skeleton.png', canvas)
+    cv2.imwrite('output/rigging_check/registered_only.png', reg_skel)
+    print(f'\nSaved output/rigging_check/registered_skeleton.png')
     print(f'  scale={smpl_scale:.4f}, mean_err={np.mean(errs):.4f}')
 
 

@@ -217,18 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 /ckpts
-/gradio_outputs
-*.ply
-*.splat
 /static
 
-# Multi-view refinement outputs
-/refine_output/
-/scratch_output/
-/demo_output/
-/pipeline_output/
-/skinned_demo/
-/synthetic_demo/
+# Experiment outputs (all results go under output/)
+/output/
 
 # YOLO model weights
 yolo*.pt
@@ -236,15 +228,8 @@ yolo*.pt
 # Large media files
 *.mp4
 *.gif
+*.ply
+*.splat
 
 # ZCode session files
 /.zcode/
-/real_body_demo
-/smplx_demo
-
-# Demo / debug render outputs
-/pointsplat_demo/
-/pointsplat_demo_test/
-/rigging_check/
-/skeleton_demo/
-/yolo_skeleton_demo/

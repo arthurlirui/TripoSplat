@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--init_view", default="00.png")
     parser.add_argument("--image_dir", default="static/000001/mvs/images")
     parser.add_argument("--transforms", default="static/000001/mvs/transforms_train.json")
-    parser.add_argument("--output_dir", default="pipeline_verify_output")
+    parser.add_argument("--output_dir", default="output/pipeline_verify_output")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_gaussians", type=int, default=131072)
     parser.add_argument("--image_scale", type=float, default=0.5)

@@ -120,7 +120,7 @@ def main():
     parser.add_argument("--ply", default="refine_output/refined.ply")
     parser.add_argument("--transforms", default="static/000001/mvs/transforms_test.json")
     parser.add_argument("--smpl_model_path", default="E:/Code/mmforall/model/assets/SMPL/SMPL_NEUTRAL.pkl")
-    parser.add_argument("--output_dir", default="coord_verify_output")
+    parser.add_argument("--output_dir", default="output/coord_verify_output")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 

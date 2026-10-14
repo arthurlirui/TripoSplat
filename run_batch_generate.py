@@ -9,8 +9,8 @@ For each timestamp:
 
 Usage:
     conda activate rtg132
-    python run_batch_generate.py --base_dir F:/Data/warm_2-mvs --output_dir gaussian_output
-    python run_batch_generate.py --base_dir F:/Data/warm_2-mvs --output_dir gaussian_output --start 000000 --end 000010
+    python run_batch_generate.py --base_dir F:/Data/warm_2-mvs --output_dir output/gaussian_output
+    python run_batch_generate.py --base_dir F:/Data/warm_2-mvs --output_dir output/gaussian_output --start 000000 --end 000010
 """
 
 import argparse
@@ -88,7 +88,7 @@ def main():
     )
     parser.add_argument('--base_dir', default='F:/Data/warm_2-mvs',
                         help='Base directory containing timestamp folders (000000, 000001, ...)')
-    parser.add_argument('--output_dir', default='gaussian_output',
+    parser.add_argument('--output_dir', default='output/gaussian_output',
                         help='Output directory for generated .ply files')
     parser.add_argument('--init_view', default='00.png',
                         help='Input image filename within each timestamp folder')

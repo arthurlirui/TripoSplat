@@ -13,7 +13,7 @@ Usage:
     python run_e2e_test.py \\
         --init_image static/000001/mvs/images/00.png \\
         --transforms static/000001/mvs/transforms_test.json \\
-        --output_dir e2e_output \\
+        --output_dir output/e2e_output \\
         --num_gaussians 131072 \\
         --num_iterations 10000 \\
         --image_scale 0.5
@@ -39,7 +39,7 @@ def main():
     parser = argparse.ArgumentParser(description="End-to-end TripoSplat + multi-view refinement test.")
     parser.add_argument('--init_image', required=True)
     parser.add_argument('--transforms', required=True)
-    parser.add_argument('--output_dir', default='e2e_output')
+    parser.add_argument('--output_dir', default='output/e2e_output')
     parser.add_argument('--num_gaussians', type=int, default=131072)
     parser.add_argument('--num_iterations', type=int, default=10000)
     parser.add_argument('--image_scale', type=float, default=0.5)
@@ -89,8 +89,11 @@ def main():
     print("=" * 70)
 
     from multiview_refine.cameras import load_cameras, find_camera_by_filename
-    from multiview_refine.gsplat_wrapper import render_alpha, render_gaussians
+    from multiview_refine.gsplat_wrapper import render_gaussians
     from multiview_refine.losses import compute_psnr
+    from multiview_refine.coord_registry import MODEL2SCENE
+    from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
+    from multiview_refine.alignment import estimate_similarity_transform_multiview
 
     cameras = load_cameras(args.transforms, device=device,
                            image_scale=args.image_scale, load_image=True)
@@ -98,47 +101,38 @@ def main():
     print(f"  {len(cameras)} cameras at {cameras[0].width}x{cameras[0].height}")
     print(f"  Init camera position: {init_cam.position.tolist()}")
 
-    # Coordinate system mapping:
-    # TripoSplat model: X=right, Y=forward, Z=down (from _DEFAULT_TRANSFORM)
-    # PLY/OpenGL:       X=right, Y=up,    Z=forward
-    # OpenCV scene:     X=right, Y=down,  Z=forward
-    # model→OpenCV = T_cv @ T_ply where:
-    #   T_ply = [[1,0,0],[0,0,-1],[0,1,0]]  (model→PLY)
-    #   T_cv  = [[1,0,0],[0,-1,0],[0,0,-1]] (PLY→OpenCV)
-    T_ply = torch.tensor([[1,0,0],[0,0,-1],[0,1,0]], dtype=torch.float32, device=device)
-    T_cv  = torch.tensor([[1,0,0],[0,-1,0],[0,0,-1]], dtype=torch.float32, device=device)
-    R_model2cv = T_cv @ T_ply
+    # ── Pre-transform: model → Y-up scene ──
+    # TripoSplat stores Gaussians in AABB [-0.5, 0.5]³.  MODEL2SCENE maps
+    # (x,y,z) → (x, z, −y) to the Y-up scene frame (the same world frame as
+    # the SfM cameras).  This is consistent with coord_registry and
+    # run_pipeline.py / run_pipeline_verify.py.
+    R_model2scene = MODEL2SCENE.to(device)
+    means_scene = means @ R_model2scene.T
+    quats_scene = quaternion_compose(rotation_matrix_to_quaternion(R_model2scene), quats)
+    print(f"  Applied MODEL2SCENE (model → Y-up scene)")
 
-    # Align virtual camera direction to real camera direction.
-    R_align = init_cam.c2w[:3, :3]
-    R = R_align @ R_model2cv
+    # ── Multi-view silhouette alignment ──
+    # Delegate to the shared alignment module, seeding the yaw search from
+    # the init camera's c2w forward direction for a faster, targeted search.
+    forward = init_cam.c2w[:3, 2]
+    init_yaw = math.atan2(float(forward[0]), float(forward[2]))
 
-    # Scene centre = median of camera positions.
-    positions = torch.stack([c.position for c in cameras])
-    scene_centre = positions.median(0).values
-    print(f"  Scene centre: {scene_centre.tolist()}")
+    scale, R, t = estimate_similarity_transform_multiview(
+        tensors=(means_scene, scales, quats_scene, opacities, sh0),
+        cameras=cameras,
+        init_yaw=init_yaw,
+        alpha_threshold=0.1,
+        verbose=True,
+    )
 
-    # Search optimal scale via silhouette IoU on init camera.
-    gt_mask = (init_cam.image.mean(0) > 0.02).float()
-    print(f"  Searching scale...")
-    best_iou, best_scale = -1, 1.0
-    for scale in np.linspace(0.1, 5.0, 50):
-        means_test = scale * (means @ R.T) + scene_centre
-        with torch.no_grad():
-            alpha = render_alpha(means_test, scales * scale, quats, opacities, init_cam)
-        r_mask = (alpha.squeeze(0) > 0.05).float()
-        inter = (r_mask * gt_mask).sum()
-        union = ((r_mask + gt_mask) > 0).float().sum()
-        iou = (inter / max(union, 1)).item()
-        if iou > best_iou:
-            best_iou, best_scale = iou, scale
-
-    scale = best_scale
-    print(f"  Best scale={scale:.4f}, IoU={best_iou:.4f}")
-
-    # Apply alignment.
-    means_aligned = scale * (means @ R.T) + scene_centre
+    # Total transform: scale * (R @ R_model2scene @ means) + t
+    means_aligned = scale * (means_scene @ R.T) + t
     scales_aligned = scales * scale
+    R_total = R @ R_model2scene
+    q_total = rotation_matrix_to_quaternion(R_total)
+    quats_aligned = quaternion_compose(q_total, quats)
+
+    print(f"  scale={scale:.4f}, t={t.tolist()}")
     print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -152,7 +146,7 @@ def main():
     psnrs_init = []
     for i, cam in enumerate(cameras):
         with torch.no_grad():
-            rgb, _, _ = render_gaussians(means_aligned, scales_aligned, quats,
+            rgb, _, _ = render_gaussians(means_aligned, scales_aligned, quats_aligned,
                                          sh0, opacities, cam, sh_degree=0, background=bg)
         p = compute_psnr(rgb, cam.image).item()
         psnrs_init.append(p)
@@ -165,7 +159,7 @@ def main():
         os.path.join(args.output_dir, 'aligned_init.ply'),
         means_aligned,
         torch.log(scales_aligned.clamp_min(1e-8)),
-        quats,
+        quats_aligned,
         torch.log(opacities.clamp(1e-6, 1-1e-6)),
         sh0,
         torch.zeros(len(means), 0, 3, device=device))
@@ -186,7 +180,7 @@ def main():
     model = RefineableGaussians(sh_degree=0, device=device)
     model._means = torch.nn.Parameter(means_aligned.contiguous())
     model._scales = torch.nn.Parameter(torch.log(scales_aligned.clamp_min(1e-8)).contiguous())
-    model._quats = torch.nn.Parameter(quats.contiguous())
+    model._quats = torch.nn.Parameter(quats_aligned.contiguous())
     model._opacities = torch.nn.Parameter(torch.log(opacities.clamp(1e-6, 1-1e-6)).contiguous())
     model._sh0 = torch.nn.Parameter(sh0.contiguous())
     model._shN = torch.nn.Parameter(torch.zeros(len(means), 0, 3, device=device), requires_grad=False)

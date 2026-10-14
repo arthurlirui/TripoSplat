@@ -2,8 +2,13 @@
 Usage: python run_example.py
 """
 
+import os
+
 if __name__ == "__main__":
     from triposplat import TripoSplatPipeline
+
+    OUT_DIR = "output/example"
+    os.makedirs(OUT_DIR, exist_ok=True)
 
     pipe = TripoSplatPipeline(
         ckpt_path              = "ckpts/diffusion_models/triposplat_fp16.safetensors",
@@ -24,9 +29,9 @@ if __name__ == "__main__":
 
     gaussian, prepared = pipe.run(INPUT, num_gaussians=262144, show_progress=True)
 
-    prepared.save("00.webp")
-    gaussian.save_ply("00.ply")
-    gaussian.save_splat("00.splat")
+    prepared.save(os.path.join(OUT_DIR, "00.webp"))
+    gaussian.save_ply(os.path.join(OUT_DIR, "00.ply"))
+    gaussian.save_splat(os.path.join(OUT_DIR, "00.splat"))
 
 
     # -----------------------------------------------------------------------
@@ -38,4 +43,4 @@ if __name__ == "__main__":
     gaussians, _ = pipe.run(INPUT, num_gaussians=counts, show_progress=True)
 
     for n, g in zip(counts, gaussians):
-        g.save_ply(f"output_{n}.ply")
+        g.save_ply(os.path.join(OUT_DIR, f"output_{n}.ply"))

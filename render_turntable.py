@@ -10,14 +10,14 @@ Usage (orbit):
     python render_turntable.py \\
         --ply refine_output/refined.ply \\
         --transforms static/000001/mvs/transforms_train.json \\
-        --output refine_output/turntable.mp4 \\
+        --output output/refine_output/turntable.mp4 \\
         --n_frames 120 --fps 30 --resolution 1024
 
 Usage (real cameras with GT comparison):
     python render_turntable.py \\
         --ply refine_output/refined.ply \\
         --transforms static/000001/mvs/transforms_train.json \\
-        --output refine_output/comparison.mp4 \\
+        --output output/refine_output/comparison.mp4 \\
         --use_real_cameras --compare_gt --image_scale 0.5
 """
 
@@ -81,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render a turntable video from refined Gaussians.")
     parser.add_argument("--ply", required=True)
     parser.add_argument("--transforms", default=None)
-    parser.add_argument("--output", default="refine_output/turntable.mp4")
+    parser.add_argument("--output", default="output/refine_output/turntable.mp4")
     parser.add_argument("--n_frames", type=int, default=120)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--resolution", type=int, default=1024)
