@@ -100,24 +100,56 @@ def _skew(v: torch.Tensor) -> torch.Tensor:
                          [-y, x, 0]], dtype=v.dtype)
 
 
-def detect_scene_up(cameras: Sequence[Camera]) -> WorldUp:
+def detect_scene_up(cameras: Sequence[Camera], min_var: float = 1e-6) -> WorldUp:
     """Heuristically guess the scene's world-up axis from camera positions.
 
     For a turntable-style body scan the cameras orbit roughly in a horizontal
     plane around the subject, so their positions have the smallest spread
     along the world-up axis.  We report the axis of least position variance.
 
-    This is only a suggestion to pick a default; the caller should print it
-    for the user to confirm.
+    **This is unreliable on degenerate camera sets.**  With only two cameras
+    nearly aligned along one axis, that axis's variance can be exactly zero,
+    which makes it look like "up".  Measured on ``static/000001/mvs``:
+
+        transforms_train (30 cams) -> "y"   (var: x=3.48, y=0.57, z=3.51)
+        transforms_val   ( 2 cams) -> "z"   (var: x=5.9e-4, y=0.47, z=0.0)  ← wrong
+
+    Trusting that "z" rotates the whole Y-up scene by 90° and silently lays the
+    subject on its side.  So when the smallest variance is degenerate we raise
+    instead of guessing, and callers that know their world (this project is
+    always Y-up: SfM ``points3d.ply`` is centred at the origin and the SMPL-X
+    template is Y-up) should pass ``src_world_up="y"`` explicitly rather than
+    relying on detection.
+
+    Args:
+        cameras: cameras to inspect.
+        min_var: if the smallest per-axis variance is below this, the set is
+            too degenerate to judge and ``ValueError`` is raised.
+
+    Returns:
+        ``"x"``, ``"y"`` or ``"z"``.
+
+    Raises:
+        ValueError: fewer than 3 cameras, or a degenerate (near-zero) variance
+            that makes the guess meaningless.
     """
     if not cameras:
         return "y"
+    if len(cameras) < 3:
+        raise ValueError(
+            f"detect_scene_up needs at least 3 cameras to judge the up axis "
+            f"(got {len(cameras)}). Pass src_world_up explicitly instead."
+        )
     pos = torch.stack([c.position.float().cpu() for c in cameras])  # (N, 3)
     var = pos.var(dim=0)
-    # Smallest variance axis is "up" (cameras spread less vertically).
-    # But for an equatorial orbit the up axis also has the smallest extent;
-    # however the subject stands *along* up, so the cameras' up spread is
-    # the orbit's vertical extent (small).  Use min-variance.
+    vmin = float(var.min().item())
+    if vmin < min_var:
+        raise ValueError(
+            "detect_scene_up: degenerate camera set — per-axis variance "
+            f"{[round(float(v), 6) for v in var]} has a near-zero axis "
+            f"({vmin:.2e}), so the 'up' axis cannot be inferred. "
+            "Pass src_world_up explicitly (this project's scenes are Y-up)."
+        )
     idx = int(torch.argmin(var).item())
     return ["x", "y", "z"][idx]
 
@@ -199,17 +231,21 @@ def convert(
     # 2. World-up rotation (only splatshop changes the world up; opencv/opengl
     #    keep the source world unchanged).
     dst_up: WorldUp = "z" if target == "splatshop" else src_world_up
+    # The registry constants are CPU tensors; the splat may be on CUDA.  Move
+    # them onto the splat's device before the matmul (a dtype-only .to() here
+    # used to raise "Expected all tensors to be on the same device").
+    dev_w = means.device
     if target == "splatshop" and src_frame == "opencv":
         # OpenCV world is Y-down; SplatShop wants Z-up.
         # Use the centralised OPENCV2SPLATSHOP_WORLD rotation (rot_x +90°).
-        R_w = OPENCV2SPLATSHOP_WORLD.to(torch.float32)
+        R_w = OPENCV2SPLATSHOP_WORLD.to(device=dev_w, dtype=torch.float32)
         means, scales, quats = _apply_transform(
-            means, scales, quats, 1.0, R_w, torch.zeros(3))
+            means, scales, quats, 1.0, R_w, torch.zeros(3, device=dev_w))
     else:
-        R_w = world_up_rotation(src_world_up, dst_up).to(torch.float32)
-        if not torch.allclose(R_w, torch.eye(3)):
+        R_w = world_up_rotation(src_world_up, dst_up).to(device=dev_w, dtype=torch.float32)
+        if not torch.allclose(R_w, torch.eye(3, device=dev_w)):
             means, scales, quats = _apply_transform(
-                means, scales, quats, 1.0, R_w, torch.zeros(3))
+                means, scales, quats, 1.0, R_w, torch.zeros(3, device=dev_w))
 
     # 3. Camera c2w: apply the same world rotation, then flip to target cam conv.
     cams_world = _apply_world_rotation_to_cameras(cameras_cv, R_w)  # OpenCV c2w, rotated world

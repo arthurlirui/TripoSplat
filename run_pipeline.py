@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 import math
 import json
@@ -106,7 +107,7 @@ def step2_align(args):
     """
     from multiview_refine.cameras import load_cameras, find_camera_by_filename
     from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
-    from multiview_refine.alignment import estimate_similarity_transform_multiview
+    from multiview_refine.alignment import estimate_similarity_transform_multiview, align_from_init_view
     from multiview_refine.coord_registry import MODEL2SCENE
 
     print("=" * 60)
@@ -121,41 +122,47 @@ def step2_align(args):
 
     cameras = load_cameras(args.transforms, device=args.device,
                            image_scale=0.25, load_image=True)
-    init_cam = find_camera_by_filename(cameras, args.init_view)
-    print(f"  Init camera: cam_idx={init_cam.cam_idx}, position={init_cam.position.tolist()}")
+    # The init view is often held out: images/00 and 01 live in
+    # transforms_{val,test}.json, not transforms_train.json.  Search every
+    # split so the documented --init_view 00.png actually works.
+    init_cam = None
+    for _split in ("val", "test", "train"):
+        _p = re.sub(r"transforms_(train|val|test)\.json$", f"transforms_{_split}.json",
+                    args.transforms)
+        if not os.path.exists(_p):
+            continue
+        try:
+            _cams = load_cameras(_p, device=args.device, image_scale=0.25, load_image=True)
+            init_cam = find_camera_by_filename(_cams, args.init_view)
+            print(f"  Init camera: {os.path.basename(_p)} cam_idx={init_cam.cam_idx}, "
+                  f"position={init_cam.position.tolist()}")
+            break
+        except ValueError:
+            continue
+    if init_cam is None:
+        raise SystemExit(
+            f"Init view {args.init_view!r} is not calibrated in any split of "
+            f"{args.transforms!r}. Pick a view present in the transforms files."
+        )
 
-    # ── Pre-transform: apply model→scene rotation ──
-    # The PLY stores Gaussians in model space (AABB [-0.5,0.5]³).  We rotate
-    # to the Y-up scene frame using MODEL2SCENE from coord_registry.  This
-    # maps (x,y,z) → (x, z, −y), putting the model in the same Y-up world
-    # frame as the SfM cameras.
-    R_model2scene = MODEL2SCENE.to(args.device)
-
-    means_scene = means @ R_model2scene.T  # rotate means to Y-up scene frame
-    quats_scene = quaternion_compose(rotation_matrix_to_quaternion(R_model2scene), quats)
-
-    # ── Extract init_yaw from the init camera's c2w rotation ──
-    forward = init_cam.c2w[:3, 2]
-    init_yaw = math.atan2(float(forward[0]), float(forward[2]))
-
-    print(f"\n  R_model2scene applied to means (model → Y-up scene)")
-    print(f"  init_yaw = {math.degrees(init_yaw):.1f}° (from c2w forward)")
-
-    # ── Delegate to the shared alignment module ──
+    # ── Align to the scene ──
     scales_activated = scales_raw.exp()
     opacities = torch.sigmoid(opacities_raw)
     colors = sh0  # (N, 1, 3) SH DC
 
-    scale, R, t = estimate_similarity_transform_multiview(
-        tensors=(means_scene, scales_activated, quats_scene, opacities, colors),
-        cameras=cameras,
-        init_yaw=init_yaw,
-        alpha_threshold=0.1,
-        verbose=True,
-    )
+    # Analytic init-view alignment: the Gaussians were generated FROM
+    # args.init_view, so its camera defines their canonical pose.  Closed form,
+    # and free of the silhouette search's failure modes (it inflates the scale
+    # and cannot tell front from back).  MODEL2SCENE is folded into R here.
+    print(f"\n  Aligning analytically from init view {args.init_view}")
+    scale, R, t = align_from_init_view(
+        means, init_cam, cameras, init_mask=init_cam.alpha, verbose=True)
 
-    # ── Apply final transform ──
-    # The alignment module returns transform relative to the scene-space
+    # ── Apply final transform (R maps the raw model frame) ──
+    means_aligned = scale * (means @ R.T) + t
+    scales_aligned_raw = scales_raw + math.log(scale)
+    q_total = rotation_matrix_to_quaternion(R)
+    quats_aligned = quaternion_compose(q_total, quats)
     # means.  Total: xyz_scene = scale * (R @ means_scene) + t
     # which is equivalent to: scale * (R @ R_model2scene @ means_orig) + t
     means_aligned = scale * (means_scene @ R.T) + t
@@ -174,11 +181,10 @@ def step2_align(args):
                        opacities_raw, sh0, shN)
 
     params = {
-        'scale': float(scale), 'rotation': R_total.cpu().numpy().tolist(),
+        'scale': float(scale), 'rotation': R.cpu().numpy().tolist(),
         'translation': t.cpu().numpy().tolist(),
-        'R_model2scene': R_model2scene.cpu().numpy().tolist(),
-        'init_yaw_deg': math.degrees(init_yaw),
-        'method': 'multiview_alignment_module',
+        'init_view': args.init_view,
+        'method': 'analytic_init_view',
     }
     with open(os.path.join(args.output_dir, "alignment_params.json"), 'w') as f:
         json.dump(params, f, indent=2)

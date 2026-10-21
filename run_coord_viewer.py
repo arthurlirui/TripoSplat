@@ -124,8 +124,16 @@ def main():
 
     # ── Source world-up ──────────────────────────────────────────────────────
     if args.src_frame == "auto" and args.world_up == "auto":
-        src_up: WorldUp = detect_scene_up(cameras)
-        print(f"  Detected scene up axis: {src_up!r} (override with --world-up)")
+        try:
+            src_up: WorldUp = detect_scene_up(cameras)
+            print(f"  Detected scene up axis: {src_up!r} (override with --world-up)")
+        except ValueError as exc:
+            # Degenerate camera set (e.g. 2 nearly-aligned views): guessing the
+            # up axis would rotate the whole scene wrongly, so stop and let the
+            # user state it rather than silently laying the subject on its side.
+            print(f"  ⚠️  Cannot infer the scene up axis: {exc}")
+            print("     Re-run with --world-up y (this project's scenes are Y-up).")
+            return
     elif args.src_frame == "opencv":
         src_up = "y"  # OpenCV world: Y is the vertical axis (down)
         print(f"  Source frame: opencv (Y-down canonical)")
