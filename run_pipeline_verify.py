@@ -9,6 +9,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -27,10 +28,27 @@ from multiview_refine.cameras import Camera, load_cameras, invert_se3, find_came
 from multiview_refine.gsplat_wrapper import render_gaussians
 from multiview_refine.coord_registry import MODEL2SCENE
 from multiview_refine.quaternion import quaternion_compose, rotation_matrix_to_quaternion
-from multiview_refine.alignment import estimate_similarity_transform_multiview, _apply_transform
+from multiview_refine.alignment import (
+    estimate_similarity_transform_multiview,
+    align_from_init_view,
+    _apply_transform,
+)
 from multiview_refine.video_io import create_video_writer
+from multiview_refine.orientation import uprightness_report, assert_upright
 
 SH_C0 = 0.28209479177387814
+
+
+def _resolve_image_path_from_camera(cam, transforms_json: str) -> str | None:
+    """Resolve the on-disk image path for a camera's ``file_path``.
+
+    ``file_path`` in transforms.json is extension-less (e.g. ``images/02``).
+    """
+    from multiview_refine.cameras import _resolve_image_path
+    base_dir = os.path.dirname(os.path.abspath(transforms_json))
+    if not cam.file_path:
+        return None
+    return _resolve_image_path(base_dir, cam.file_path)
 
 
 def tensor_to_bgr(t, alpha=None):
@@ -65,13 +83,19 @@ def save_side_by_side(render_img, gt_img, path, label_r="Render", label_g="GT"):
 
 def main():
     parser = argparse.ArgumentParser(description="Full pipeline coordinate verification")
-    parser.add_argument("--init_view", default="00.png")
+    parser.add_argument("--init_view", default="00.png",
+                        help="Image used to initialise TripoSplat.  Must be a "
+                             "FULL-BODY view whose alpha does not touch the image "
+                             "border — images/02,05,16 etc. are cropped close-ups "
+                             "and produce a torso-only model with no legs.")
     parser.add_argument("--image_dir", default="static/000001/mvs/images")
     parser.add_argument("--transforms", default="static/000001/mvs/transforms_train.json")
     parser.add_argument("--output_dir", default="output/pipeline_verify_output")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_gaussians", type=int, default=131072)
     parser.add_argument("--image_scale", type=float, default=0.5)
+    parser.add_argument("--refined_ply", default=None,
+                        help="Optional refined PLY to compare in stage 5.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -96,16 +120,46 @@ def main():
     cv2.imwrite(os.path.join(args.output_dir, "00_init_image.png"), init_disp)
     print(f"  Init image: {init_img_path}, shape={init_img.shape}")
 
-    # Save a few GT views
-    for i in [0, 8, 16, 24]:
-        gt_path = os.path.join(args.image_dir, f"{i:02d}.png")
-        if os.path.exists(gt_path):
-            gt_img = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
-            if gt_img.shape[-1] == 4:
-                gt_disp = np.concatenate([gt_img[:, :, :3], np.stack([gt_img[:, :, 3]] * 3, axis=-1)], axis=1)
+    # Warn if the init image is a cropped close-up.  TripoSplat can only
+    # hallucinate what it can see: a torso-only input yields a torso-only
+    # avatar (no legs), which then cannot be aligned to full-body GT.
+    if init_img.shape[-1] == 4:
+        _a = init_img[:, :, 3] > 128
+        if _a.any():
+            _touch = [bool(_a[0].any()), bool(_a[-1].any()),
+                      bool(_a[:, 0].any()), bool(_a[:, -1].any())]
+            if any(_touch):
+                edges = [n for n, t in zip(("top", "bottom", "left", "right"), _touch) if t]
+                print(f"  ⚠️  init image foreground touches the {'/'.join(edges)} border — "
+                      "this is a cropped view. The generated avatar will be missing "
+                      "whatever is cut off (e.g. no legs). Prefer a full-body view.")
             else:
-                gt_disp = gt_img
-            cv2.imwrite(os.path.join(args.output_dir, f"00_gt_cam{i:02d}.png"), gt_disp)
+                print("  ✅ init image contains a complete, uncropped subject")
+
+    # Save a few GT views.
+    # IMPORTANT: cameras[i] is NOT images/{i:02d}.  transforms_train.json
+    # starts at images/02, so the camera-list index and the filename drift
+    # apart.  Stages 2 and 4 below render `cameras[i]` and label the panel
+    # "cam{i}", so the stage-0 reference images MUST be pulled from the same
+    # camera's file_path — otherwise the side-by-side pairs two different
+    # viewpoints and the comparison is meaningless.
+    _cam_list = load_cameras(args.transforms, device=device,
+                             image_scale=1.0, load_image=False)
+    for i in [0, 8, 16, 24]:
+        if i >= len(_cam_list):
+            continue
+        gt_path = _resolve_image_path_from_camera(_cam_list[i], args.transforms)
+        if gt_path is None or not os.path.exists(gt_path):
+            print(f"  [warn] GT for camera {i} ({_cam_list[i].file_path}) not found")
+            continue
+        gt_img = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+        if gt_img.shape[-1] == 4:
+            gt_disp = np.concatenate([gt_img[:, :, :3], np.stack([gt_img[:, :, 3]] * 3, axis=-1)], axis=1)
+        else:
+            gt_disp = gt_img
+        fname = os.path.basename(_cam_list[i].file_path)
+        cv2.imwrite(os.path.join(args.output_dir, f"00_gt_cam{i:02d}.png"), gt_disp)
+        print(f"  GT cam{i:02d} <- {fname}.png")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Stage 1: Run TripoSplat on init image (fresh generation)
@@ -177,8 +231,29 @@ def main():
 
     # Load cameras (OpenCV convention from load_cameras)
     cameras = load_cameras(args.transforms, device=device, image_scale=args.image_scale, load_image=True)
-    init_cam = find_camera_by_filename(cameras, args.init_view)
-    print(f"  Loaded {len(cameras)} cameras, init cam = {args.init_view}")
+    # The init view is usually NOT in transforms_train.json — a good full-body
+    # frame is typically held out into transforms_val.  Its pose is essential
+    # for the analytic alignment, so search every split before giving up.
+    init_cam = None
+    split_path = args.transforms
+    for _split in ("val", "test", "train"):
+        _p = re.sub(r"transforms_(train|val|test)\.json$", f"transforms_{_split}.json",
+                    args.transforms)
+        if not os.path.exists(_p):
+            continue
+        try:
+            _cams = load_cameras(_p, device=device, image_scale=args.image_scale,
+                                 load_image=True)
+            init_cam = find_camera_by_filename(_cams, args.init_view)
+            split_path = _p
+            print(f"  Init view {args.init_view} found in {os.path.basename(_p)} "
+                  f"(idx {init_cam.cam_idx}, position={init_cam.position.tolist()})")
+            break
+        except ValueError:
+            continue
+    if init_cam is None:
+        print(f"  ⚠️  Init view {args.init_view} is not calibrated in any split — "
+              "analytic alignment unavailable, will fall back to silhouette search.")
 
     # Render from all cameras WITHOUT alignment (just MODEL2SCENE)
     # This shows the raw model→scene alignment without similarity transform.
@@ -193,9 +268,10 @@ def main():
                 cam, background=bg, sh_degree=0)
         render_img = tensor_to_bgr(rgb, alpha)
         gt_img = tensor_to_bgr(cam.image) if cam.image is not None else np.zeros_like(render_img)
+        gt_name = os.path.basename(cam.file_path) or f"cam{i}"
         save_side_by_side(render_img, gt_img,
                           os.path.join(args.output_dir, f"02_no_align_cam{i:02d}.png"),
-                          f"MODEL2SCENE only cam{i}", f"GT cam{i}")
+                          f"MODEL2SCENE only cam{i}", f"GT {gt_name}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Stage 3: Run alignment (estimate_similarity_transform_multiview)
@@ -204,25 +280,52 @@ def main():
     print("Stage 3: Run alignment (estimate_similarity_transform_multiview)")
     print("=" * 70)
 
-    # Prepare tensors for alignment (in scene frame after MODEL2SCENE)
+    # Prepare tensors for alignment
     scales_act_al = scales_act
     opac_al = opac_act
 
-    scale, R, t = estimate_similarity_transform_multiview(
-        tensors=(means_scene, scales_act_al, quats_scene, opac_al, sh0),
-        cameras=cameras,
-        init_yaw=None,  # Let it do full search
-        alpha_threshold=0.1,
-        verbose=True,
-    )
+    # ── Primary: analytic alignment anchored on the generation view ──
+    # The Gaussians were generated FROM args.init_view, so that view's camera
+    # defines their canonical pose.  Since MODEL2SCENE puts the avatar facing a
+    # known scene axis, the rotation is solvable in closed form, and the scale
+    # follows from the subject's apparent pixel height.  This replaces the
+    # silhouette grid search, which empirically preferred inflated scales
+    # (a 2.6 m "person") and could not tell front from back.
+    scale = R = t = None
+    if init_cam is not None:
+        print("  Using analytic init-view alignment (no silhouette search)")
+        scale, R, t = align_from_init_view(
+            means_model,            # raw AABB frame; MODEL2SCENE folds into R
+            init_cam,
+            cameras,
+            init_mask=init_cam.alpha,
+            verbose=True,
+        )
+    else:
+        # Fallback: the init view has no calibration in transforms_train.json.
+        print("  Init view not calibrated — falling back to silhouette search")
+        fwd = None
+        scale, R, t = estimate_similarity_transform_multiview(
+            tensors=(means_scene, scales_act_al, quats_scene, opac_al, sh0),
+            cameras=cameras,
+            init_yaw=None,
+            alpha_threshold=0.1,
+            verbose=True,
+        )
 
     print(f"\n  Alignment result: scale={scale:.4f}")
     print(f"  R:\n{R.cpu().numpy()}")
     print(f"  t: {t.cpu().numpy()}")
 
-    # Apply full transform: means_aligned = scale * (R @ means_scene) + t
-    means_aligned, scales_aligned, quats_aligned = _apply_transform(
-        means_scene, scales_act_al, quats_scene, scale, R, t)
+    # Apply full transform.  The analytic path returns R in the *model* frame
+    # (already folding in MODEL2SCENE), so apply it to means_model; the
+    # fallback path expects the MODEL2SCENE-rotated means.
+    if init_cam is not None:
+        means_aligned, scales_aligned, quats_aligned = _apply_transform(
+            means_model, scales_act_al, quats_raw, scale, R, t)
+    else:
+        means_aligned, scales_aligned, quats_aligned = _apply_transform(
+            means_scene, scales_act_al, quats_scene, scale, R, t)
     scales_aligned_raw = torch.log(scales_aligned.clamp_min(1e-8))
 
     print(f"  Aligned means range: x=[{means_aligned[:,0].min():.3f}, {means_aligned[:,0].max():.3f}]")
@@ -252,6 +355,7 @@ def main():
     print("=" * 70)
 
     comparison_frames = []
+    pred_masks, real_masks = [], []
     for i, cam in enumerate(cameras):
         with torch.no_grad():
             rgb, alpha, _ = render_gaussians(
@@ -260,10 +364,17 @@ def main():
         render_img = tensor_to_bgr(rgb, alpha)
         gt_img = tensor_to_bgr(cam.image) if cam.image is not None else np.zeros_like(render_img)
 
-        # Save individual comparison
+        # Collect silhouettes for the uprightness gate.
+        pred_masks.append((alpha.squeeze(0) > 0.1).cpu().numpy())
+        if cam.alpha is not None:
+            real_masks.append((cam.alpha.squeeze(0) > 0.5).cpu().numpy())
+
+        # Save individual comparison.  Label with the real filename so the
+        # panel can be traced back to an actual image.
+        gt_name = os.path.basename(cam.file_path) or f"cam{i}"
         canvas = save_side_by_side(render_img, gt_img,
                                    os.path.join(args.output_dir, f"04_aligned_vs_gt_cam{i:02d}.png"),
-                                   f"Aligned render cam{i}", f"GT cam{i}")
+                                   f"Aligned render cam{i}", f"GT {gt_name}")
         comparison_frames.append(canvas)
 
         # Print stats
@@ -271,8 +382,25 @@ def main():
         if gt_alpha is not None:
             gt_cov = (gt_alpha > 0.5).float().mean().item()
             pred_cov = (alpha > 0.5).float().mean().item()
-            print(f"  cam{i:02d}: GT coverage={gt_cov:.3f}, Render coverage={pred_cov:.3f}, "
-                  f"PSNR region: render_mean={rgb.mean().item():.4f}")
+            print(f"  cam{i:02d} ({gt_name}): GT coverage={gt_cov:.3f}, "
+                  f"Render coverage={pred_cov:.3f}")
+
+    # ── Uprightness gate ──
+    # Silhouette IoU cannot reject a 180° flip (an upright figure and its
+    # vertical mirror overlap ~0.53), so check orientation explicitly before
+    # trusting any IoU number.
+    rep = uprightness_report(pred_masks, real_masks or None)
+    print(f"\n  Uprightness: {rep['frac_upright']:.0%} of {rep['n_judged']} rendered "
+          f"silhouettes are head-up"
+          + (f" (GT reference: {rep['real_frac_upright']:.0%})"
+             if real_masks else ""))
+    with open(os.path.join(args.output_dir, "uprightness.json"), "w") as f:
+        json.dump(rep, f, indent=2)
+    try:
+        assert_upright(pred_masks, real_masks or None)
+        print("  ✅ Orientation check passed")
+    except AssertionError as exc:
+        print(f"  ❌ {exc}")
 
     # Save comparison video
     video_path = os.path.join(args.output_dir, "04_aligned_vs_gt.mp4")
@@ -285,20 +413,35 @@ def main():
         print(f"  Saved video: {video_path}")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Stage 5: Load existing refined.ply and compare
+    # Stage 5 (+7): Load refined PLY and compare against the same views
     # ═══════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
-    print("Stage 5: Compare with existing refined.ply")
+    print("Stage 5: Compare refined Gaussians against GT")
     print("=" * 70)
 
-    refined_path = "refine_output/refined.ply"
-    if os.path.exists(refined_path):
+    # `refined_ply` is either an explicit --refined_ply or the per-run output
+    # of run_alignment_refine_test.py.  The old hard-coded
+    # "refine_output/refined.ply" was missing the leading "output/", so this
+    # whole stage silently no-oped and the refined model was never rendered.
+    refined_candidates = [
+        args.refined_ply,
+        os.path.join("output", "alignment_refine_test", "refined_aligned.ply"),
+        os.path.join("output", "refine_output", "refined.ply"),
+    ]
+    refined_path = next((p for p in refined_candidates if p and os.path.exists(p)), None)
+    if refined_path is None:
+        print("  [skip] no refined PLY found. Looked for:")
+        for p in refined_candidates:
+            if p:
+                print(f"           {p}")
+    else:
         means_ref, scales_ref_raw, quats_ref, opac_ref_raw, sh0_ref, _ = load_gaussians_ply(
             refined_path, device=device)
         scales_ref = scales_ref_raw.exp()
         opac_ref = torch.sigmoid(opac_ref_raw)
-        print(f"  Loaded {means_ref.shape[0]} refined Gaussians")
+        print(f"  Loaded {means_ref.shape[0]} refined Gaussians from {refined_path}")
 
+        ref_masks = []
         for i in [0, 8, 16, 24]:
             if i >= len(cameras):
                 continue
@@ -309,9 +452,15 @@ def main():
                     cam, background=bg, sh_degree=0)
             render_img = tensor_to_bgr(rgb, alpha)
             gt_img = tensor_to_bgr(cam.image) if cam.image is not None else np.zeros_like(render_img)
+            gt_name = os.path.basename(cam.file_path) or f"cam{i}"
             save_side_by_side(render_img, gt_img,
                               os.path.join(args.output_dir, f"05_refined_vs_gt_cam{i:02d}.png"),
-                              f"refined.ply cam{i}", f"GT cam{i}")
+                              f"refined cam{i}", f"GT {gt_name}")
+            ref_masks.append((alpha.squeeze(0) > 0.1).cpu().numpy())
+
+        rep_ref = uprightness_report(ref_masks)
+        print(f"  Uprightness (refined): {rep_ref['frac_upright']:.0%} head-up, "
+              f"flip_suspected={rep_ref['flip_suspected']}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Stage 6: Summary

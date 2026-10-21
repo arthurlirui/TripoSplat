@@ -60,33 +60,59 @@ def test_rotation_orthonormal(R, name):
 
 # ── MODEL2SCENE: model frame → Y-up scene ──────────────────────────────────
 
-def test_model2scene_is_default_transform():
-    """MODEL2SCENE equals TripoSplat's _DEFAULT_TRANSFORM.
+def test_model2scene_is_column_vector_form():
+    """MODEL2SCENE is stored in **column-vector** form.
 
-    _DEFAULT_TRANSFORM = [[1,0,0],[0,0,-1],[0,1,0]]  (model → Y-up world)
+    Consumers apply it as ``means @ R.T`` (equivalent to ``R @ means``), so
+    the stored matrix must be the column-vector matrix, not Tripo's
+    row-vector export form (which is its transpose).
     """
-    expected = torch.tensor([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
+    expected = torch.tensor([[1., 0., 0.], [0., 0., 1.], [0., -1., 0.]])
     assert torch.allclose(MODEL2SCENE, expected, atol=1e-6)
+
+
+def test_model2scene_not_the_transposed_bug():
+    """Regression: the old value left every render 180° upside down.
+
+    The buggy matrix was Tripo's row-vector ``_DEFAULT_TRANSFORM``
+    ``[[1,0,0],[0,0,-1],[0,1,0]]`` = the transpose of the correct value.
+    That transposition mapped the avatar's up axis to *down*.
+    """
+    buggy = torch.tensor([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
+    assert not torch.allclose(MODEL2SCENE, buggy, atol=1e-6)
+    assert torch.allclose(MODEL2SCENE, buggy.T, atol=1e-6)
+
+
+def test_model2scene_upright():
+    """The avatar's body axis (model +Z, feet→head) must map to scene +Y (up).
+
+    This is the invariant the flip bug violated.  If this test ever fails,
+    every downstream render is upside down regardless of IoU.
+    """
+    up_model = torch.tensor([[0.0, 0.0, 1.0]])          # feet → head
+    up_scene = transform_means(up_model, MODEL2SCENE)
+    assert torch.allclose(up_scene, torch.tensor([[0.0, 1.0, 0.0]]), atol=1e-6), \
+        "model +Z must map to scene +Y (head up), got " + str(up_scene.tolist())
 
 
 def test_model2scene_maps_axes():
     """Model frame (x, y, z) → Y-up scene (x, z, -y).
 
-    MODEL2SCENE = [[1,0,0],[0,0,-1],[0,1,0]]
-    so (x, y, z) → (x, -z, y).
+    MODEL2SCENE = [[1,0,0],[0,0,1],[0,-1,0]]
+    so (x, y, z) → (x, z, -y).
 
-    Model "forward" (0, 0, 1) → scene "down" (0, -1, 0) — model Z becomes
-    scene -Y (downward).  This matches TripoSplat's export convention.
+    Model "forward" (0, 1, 0) → scene backward (0, 0, -1); model "up"
+    (0, 0, 1) → scene up (0, 1, 0).
     """
-    # Model "forward" (0, 0, 1) → scene (0, -1, 0)
-    fwd_model = torch.tensor([[0.0, 0.0, 1.0]])
+    # Model +Y (character's facing direction in the model frame) → scene -Z
+    fwd_model = torch.tensor([[0.0, 1.0, 0.0]])
     fwd_scene = transform_means(fwd_model, MODEL2SCENE)
-    assert torch.allclose(fwd_scene, torch.tensor([[0.0, -1.0, 0.0]]), atol=1e-6)
+    assert torch.allclose(fwd_scene, torch.tensor([[0.0, 0.0, -1.0]]), atol=1e-6)
 
-    # Model "up" (0, 1, 0) → scene (0, 0, 1)
-    up_model = torch.tensor([[0.0, 1.0, 0.0]])
+    # Model "up" (0, 0, 1) → scene up (0, 1, 0)
+    up_model = torch.tensor([[0.0, 0.0, 1.0]])
     up_scene = transform_means(up_model, MODEL2SCENE)
-    assert torch.allclose(up_scene, torch.tensor([[0.0, 0.0, 1.0]]), atol=1e-6)
+    assert torch.allclose(up_scene, torch.tensor([[0.0, 1.0, 0.0]]), atol=1e-6)
 
 
 # ── SMPL2SCENE: identity (both Y-up) ───────────────────────────────────────

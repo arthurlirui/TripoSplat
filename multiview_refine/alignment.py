@@ -416,6 +416,129 @@ def estimate_similarity_transform(
     return scale, R, t
 
 
+def align_from_init_view(
+    means: torch.Tensor,
+    init_camera: Camera,
+    cameras: list[Camera],
+    scene_centroid: Optional[torch.Tensor] = None,
+    init_mask: Optional[torch.Tensor] = None,
+    alpha_threshold: float = 0.5,
+    verbose: bool = True,
+) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """**Analytic** alignment anchored on the view TripoSplat generated from.
+
+    TripoSplat renders its output from a canonical camera looking at the
+    subject's face.  After :data:`~.coord_registry.MODEL2SCENE` the avatar's
+    facing direction is therefore a known constant scene axis
+    (:data:`~.coord_registry.MODEL_FRONT_SCENE`), and the init view's camera
+    must sit on that axis.  That makes yaw solvable in closed form — no
+    silhouette search, and none of its failure modes.
+
+    Why not search: silhouette IoU (and even masked RGB) prefers *inflated*
+    scales and confuses front with back.  Measured on this dataset, picking by
+    init-view IoU favoured a 2.6 m "person" over the true ~1.76 m, and chose a
+    back view over the front.  Anchoring removes both degrees of freedom.
+
+    Scale instead comes from a physical constraint: the subject's apparent
+    pixel height in the init image must match the model's metric height at the
+    camera's distance.
+
+    Args:
+        means: (N, 3) Gaussian centres in the raw TripoSplat AABB frame.
+        init_camera: Camera whose image produced the Gaussians.
+        cameras: Multi-view cameras, used to estimate the scene centre (and
+            hence the subject's distance from the init camera).
+        scene_centroid: Subject centre in world coords.  Defaults to the
+            **origin**: SfM reconstructions here are centred on the subject
+            (verified against ``static/*/mvs/points3d.ply``, whose median is
+            ~(0, 0, 0)).  The mean camera position is a poor proxy — the
+            capture rig is not symmetric in Y, so it sits ~0.36 m off, which
+            skews the derived distance and hence the scale.
+        init_mask: (H, W) or (1, H, W) foreground mask of the init image.
+            Its pixel height sets the scale; its centroid sets the placement.
+        alpha_threshold: Threshold for the init mask.
+        verbose: Print the derived transform.
+
+    Returns:
+        ``(scale, R (3,3), t (3,))`` with
+        ``xyz_scene = scale * (R @ xyz_model) + t``; ``MODEL2SCENE`` is folded
+        into ``R``.
+    """
+    from .coord_registry import MODEL2SCENE, MODEL_FRONT_SCENE
+    import torch as _t
+
+    device = init_camera.w2c.device
+    means = means.to(device).float()
+
+    # ── Scene centre & subject distance ──
+    if scene_centroid is None:
+        scene_centroid = _t.zeros(3, dtype=_t.float32, device=device)
+    scene_centroid = scene_centroid.to(device).float()
+
+    cam_pos = init_camera.position.to(device).float()
+    offset = cam_pos - scene_centroid
+    distance = float(offset.norm())
+
+    # ── Yaw: rotate MODEL_FRONT_SCENE onto the subject→camera direction ──
+    flat = offset * _t.tensor([1.0, 0.0, 1.0], device=device)
+    if float(flat.norm()) < 1e-6:
+        flat = _t.tensor([0.0, 0.0, 1.0], device=device)
+    flat = flat / flat.norm()
+    # R_y(θ) @ (1,0,0) = (cosθ, 0, -sinθ)
+    theta = math.atan2(-float(flat[2]), float(flat[0]))
+    c, s_ = math.cos(theta), math.sin(theta)
+    R_yaw = _t.tensor([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]],
+                      dtype=_t.float32, device=device)
+    # The model must first face +X in the scene frame, which is exactly what
+    # MODEL_FRONT_SCENE records for the MODEL2SCENE-converted model.  Rotating
+    # that constant onto `flat` is R_yaw ∘ (facing→+X).  Since MODEL2SCENE
+    # already yields facing = +X, only R_yaw is needed on top of it.
+    R = R_yaw @ MODEL2SCENE.to(device)
+
+    # ── Scale from apparent pixel height ──
+    model_scene = means @ R.T
+    model_h = float(model_scene[:, 1].max() - model_scene[:, 1].min())
+
+    if init_mask is not None:
+        m = init_mask if init_mask.dim() == 2 else init_mask.squeeze(0)
+        m = m.to(device)
+        rows = _t.where((m > alpha_threshold).any(dim=1))[0]
+        app_px = float(rows.max() - rows.min() + 1) if rows.numel() else float(init_camera.height)
+    else:
+        m = None
+        app_px = float(init_camera.height)
+
+    # app_px = fy * (s * model_h) / distance  =>  s = app_px * distance / (fy * model_h)
+    scale = app_px * distance / (init_camera.fy * max(model_h, 1e-6))
+
+    # ── Translation: land the subject on the init view's pixel centroid ──
+    if m is not None:
+        ys, xs = _t.where(m > alpha_threshold)
+    else:
+        ys = xs = None
+    if ys is not None and ys.numel():
+        u = float(xs.float().mean())
+        v = float(ys.float().mean())
+        ray_cam = _t.tensor([(u - init_camera.cx) / init_camera.fx,
+                             (v - init_camera.cy) / init_camera.fy, 1.0], device=device)
+        ray_cam = ray_cam / ray_cam.norm()
+        ray_world = init_camera.c2w[:3, :3].to(device).float() @ ray_cam
+    else:
+        ray_world = init_camera.c2w[:3, 2].to(device).float()
+        ray_world = ray_world / ray_world.norm()
+
+    target_world = cam_pos + ray_world * distance
+    t = target_world - scale * (R @ means.mean(dim=0))
+
+    if verbose:
+        print(f"  Analytic init-view alignment: yaw={math.degrees(theta):.1f}°, "
+              f"distance={distance:.3f}, model_h={model_h:.3f}, "
+              f"apparent_px={app_px:.0f}, scale={scale:.3f} "
+              f"(=> subject {model_h*scale:.2f} m tall)")
+
+    return scale, R, t
+
+
 def align_from_known_c2w(
     tripo_gaussian,
     init_camera: Camera,

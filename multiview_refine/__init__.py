@@ -25,6 +25,12 @@ from .quaternion import (
 )
 from .ply_io import load_gaussians_ply, save_gaussians_ply
 from .video_io import create_video_writer
+from .orientation import (
+    silhouette_orientation_stats,
+    is_upright,
+    uprightness_report,
+    assert_upright,
+)
 
 __all__ = [
     "Camera",
@@ -51,4 +57,8 @@ __all__ = [
     "load_gaussians_ply",
     "save_gaussians_ply",
     "create_video_writer",
+    "silhouette_orientation_stats",
+    "is_upright",
+    "uprightness_report",
+    "assert_upright",
 ]

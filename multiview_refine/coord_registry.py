@@ -25,9 +25,9 @@ The pipeline distinguishes **camera convention** from **world convention**:
 * **SplatShop frame** — OpenGL camera (+X R, +Y U, -Z F) + Z-up world.  Export
   rotates the Y-up world to Z-up and flips cameras back to OpenGL.
 
-* **TripoSplat model frame** — normalized AABB ``[-0.5, 0.5]³``.  The export
-  transform ``_DEFAULT_TRANSFORM = [[1,0,0],[0,0,-1],[0,1,0]]`` maps this to
-  Y-up world.  ``MODEL2SCENE`` below is the full model→Y-up-scene rotation.
+* **TripoSplat model frame** — normalized AABB ``[-0.5, 0.5]³``, **Z-up**: the
+  avatar's head→feet axis is model **+Z**.  ``MODEL2SCENE`` below rotates it
+  into the Y-up scene frame.
 
 Conversions
 -----------
@@ -56,24 +56,48 @@ CANONICAL_WORLD_UP: Literal["y"] = "y"
 
 # ── TripoSplat model frame → Y-up scene ─────────────────────────────────────
 #
-# TripoSplat stores Gaussians in [-0.5, 0.5]³.  The export transform
-# ``_DEFAULT_TRANSFORM = [[1,0,0],[0,0,-1],[0,1,0]]`` already maps this to a
-# Y-up world frame (new Y = -old Z, new Z = old Y).  ``run_pipeline.py``
-# previously combined this with an additional OpenGL→OpenCV flip, but that
-# was incorrect: the scene world is Y-up, not Y-down.
+# TripoSplat stores Gaussians in a Z-up AABB [-0.5, 0.5]³ whose +Z axis runs
+# from the avatar's feet toward its head.  The scene world is Y-up, so the
+# model must be rotated -90° about X.
 #
-# MODEL2SCENE = the _DEFAULT_TRANSFORM itself, mapping model (x,y,z) →
-# scene (x, z, -y) i.e. Y-up world.
+# Convention note: every consumer applies this matrix as ``means @ R.T``
+# (row-vector form), which is equivalent to the column-vector product
+# ``R @ means``.  So ``MODEL2SCENE`` below must be written in **column-vector**
+# form to yield the documented mapping (x, y, z) → (x, z, -y):
+#
+#     R = [[1, 0, 0],      R @ (0, 1, 0) = (0, 0, -1)   # model Y → scene -Z
+#          [0, 0, 1],      R @ (0, 0, 1) = (0, 1, 0)    # model Z → scene +Y (up)
+#          [0, -1, 0]]
+#
+# An earlier version stored the matrix in Tripo's *row-vector* export form
+# ([[1,0,0],[0,0,-1],[0,1,0]], i.e. the transpose of the above).  Because the
+# code applies it with ``means @ R.T``, that transposition mapped model +Z to
+# scene -Y and left every render 180° upside down.  See tests
+# ``test_model2scene_upright`` which pins the avatar's up axis.
 MODEL2SCENE = torch.tensor(
     [[1.0, 0.0, 0.0],
-     [0.0, 0.0, -1.0],
-     [0.0, 1.0, 0.0]],
+     [0.0, 0.0, 1.0],
+     [0.0, -1.0, 0.0]],
     dtype=torch.float32,
 )
 
 # Backward-compatible alias (the old name was MODEL2OPENCV, but the transform
 # target is the Y-up scene, not an OpenCV world).
 MODEL2OPENCV = MODEL2SCENE  # deprecated alias, kept for run_pipeline.py
+
+# ── Which way does the avatar face, after MODEL2SCENE? ──────────────────────
+#
+# Verified empirically by rendering the converted model from the four scene
+# axes (see output/pipeline_fixed/model_facing.png): a camera on **+X** sees
+# the face, one on -X sees the back.  TripoSplat always generates the subject
+# facing its canonical camera, so once MODEL2SCENE is applied the facing
+# direction is a fixed scene axis — it is a constant, not something to search
+# for.
+#
+# Because the model is generated *from* a specific view, that view's camera
+# must lie on this axis: ``align_from_init_view`` uses the constant to solve
+# the yaw analytically instead of guessing it from silhouettes.
+MODEL_FRONT_SCENE = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
 
 # ── SMPL Y-up → Y-up scene: identity ────────────────────────────────────────
 #

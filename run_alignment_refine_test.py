@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -31,6 +32,7 @@ OUTPUT_DIR = "output/alignment_refine_test"
 IMAGE_SCALE = 0.25  # downscale for speed
 REFINE_ITERS = 500
 SH_DEGREE = 0
+INIT_VIEW = "00.png"  # full-body, uncropped generation view
 
 
 def main():
@@ -88,30 +90,65 @@ def main():
     print(f"  Applied MODEL2SCENE (model → Y-up scene)")
     print(f"  Means range: [{means.min():.3f}, {means.max():.3f}]")
 
-    # ── Step 3: Coarse alignment (silhouette IoU grid search) ──
+    # ── Step 3: Coarse alignment ──
+    # Prefer the analytic init-view alignment: it is closed-form, and avoids
+    # the silhouette search's two failure modes on this data (it inflates the
+    # scale and cannot distinguish front from back).
     print("\n" + "=" * 60)
-    print("Step 3: Coarse alignment (silhouette IoU)")
+    print("Step 3: Coarse alignment")
     print("=" * 60)
 
-    from multiview_refine.alignment import estimate_similarity_transform_multiview
+    from multiview_refine.alignment import (
+        estimate_similarity_transform_multiview,
+        align_from_init_view,
+    )
+    from multiview_refine.cameras import find_camera_by_filename
 
     t0 = time.time()
-    scale_coarse, R_coarse, t_coarse_val = estimate_similarity_transform_multiview(
-        tensors=(means, scales, quats, opacities, colors),
-        cameras=cameras,
-        rmbg_fn=None,
-        n_rotation_samples=24,
-        n_scale_samples=10,
-        scale_range=(0.05, 2.0),
-        alpha_threshold=0.1,
-        init_yaw=None,
-        verbose=True,
-    )
+    init_cam = None
+    for split in ("val", "test", "train"):
+        p = re.sub(r"transforms_(train|val|test)\.json$", f"transforms_{split}.json",
+                   TRANSFORMS_JSON)
+        if not os.path.exists(p):
+            continue
+        try:
+            _c = load_cameras(p, base_dir=os.path.dirname(os.path.abspath(p)),
+                              device=device, image_scale=IMAGE_SCALE, load_image=True)
+            init_cam = find_camera_by_filename(_c, INIT_VIEW)
+            break
+        except ValueError:
+            continue
+
+    if init_cam is not None:
+        print(f"  Analytic init-view alignment using {INIT_VIEW} from {split} split")
+        # means_raw is the raw AABB frame; MODEL2SCENE is folded into R.
+        scale_coarse, R_coarse, t_coarse_val = align_from_init_view(
+            means_raw, init_cam, cameras, init_mask=init_cam.alpha, verbose=True)
+    else:
+        print("  Init view uncalibrated — falling back to silhouette search")
+        scale_coarse, R_coarse, t_coarse_val = estimate_similarity_transform_multiview(
+            tensors=(means, scales, quats, opacities, colors),
+            cameras=cameras,
+            rmbg_fn=None,
+            n_rotation_samples=24,
+            n_scale_samples=10,
+            scale_range=(0.05, 2.0),
+            alpha_threshold=0.1,
+            init_yaw=None,
+            verbose=True,
+        )
+        # The fallback search returns R in the MODEL2SCENE-rotated frame;
+        # fold MODEL2SCENE in so both paths agree.
+        R_coarse = R_coarse @ MODEL2SCENE.to(device)
     time_coarse = time.time() - t0
     print(f"\n  Coarse alignment done in {time_coarse:.1f}s")
     print(f"  scale={scale_coarse:.4f}")
     print(f"  R=\n{R_coarse}")
     print(f"  t={t_coarse_val.tolist()}")
+
+    # Both paths now return R that maps the RAW model frame to the scene, so
+    # every downstream call uses means_raw (not the MODEL2SCENE-rotated copy).
+    means = means_raw
 
     # Save coarse transform
     coarse_result = {
