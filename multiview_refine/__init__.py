@@ -31,6 +31,11 @@ from .orientation import (
     uprightness_report,
     assert_upright,
 )
+from .registration import (
+    RegistrationResult,
+    register_gaussians_to_scene,
+    verify_registration,
+)
 
 __all__ = [
     "Camera",
@@ -61,4 +66,7 @@ __all__ = [
     "is_upright",
     "uprightness_report",
     "assert_upright",
+    "RegistrationResult",
+    "register_gaussians_to_scene",
+    "verify_registration",
 ]

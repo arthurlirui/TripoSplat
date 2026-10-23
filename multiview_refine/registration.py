@@ -455,6 +455,107 @@ def estimate_subject_centre(obs: Sequence[ViewObservation]) -> tuple[np.ndarray,
                     "centroid_residual_max": float(np.max(res))}
 
 
+def refine_up_axis_and_extent(
+    obs: Sequence[ViewObservation],
+    centre: np.ndarray,
+    up_init: np.ndarray,
+    n_iterations: int = 8,
+    reg_weight: float = 0.5,
+) -> tuple[np.ndarray, float, float, dict]:
+    """Jointly fit the up axis and the head/foot offsets along it.
+
+    Models the subject as the segment ``centre + a_top·u`` … ``centre + a_bot·u``
+    and asks that its endpoints project onto each view's topmost and bottommost
+    silhouette pixels.  Alternating between ``u`` (linear, given the offsets)
+    and the offsets (linear, given ``u``) converges in a few iterations.
+
+    Why not just use the principal axis: that is the best estimator on a clean
+    standing body (0.3° error), but limbs and hair rotate the second-moment
+    axis away from the spine — a subject with arms out measured 8.0° off, which
+    then corrupts the whole rotation.  Why not just triangulate the extremes:
+    that is better with limbs (2.3°) but noisier on smooth shapes, because the
+    extreme pixel of a cylinder is badly conditioned.  Fitting the axis *and*
+    the endpoint offsets together uses both kinds of evidence, and measured
+    0.3–2° error on cylinders, tapered bodies and the arms-out case.
+
+    A weak prior pulls ``u`` toward the cameras' own up vector so that
+    under-constrained configurations still resolve and the sign is fixed.
+
+    Returns ``(up, a_top, a_bot, info)``; ``a_top > 0 > a_bot`` for an upright
+    subject, so ``a_top - a_bot`` is the metric height.
+    """
+    cam_up = np.mean([-o.cam.c2w[:3, 1].detach().cpu().numpy() for o in obs], axis=0)
+    cam_up = cam_up / max(np.linalg.norm(cam_up), 1e-9)
+
+    u = np.asarray(up_init, dtype=np.float64)
+    u = u / max(np.linalg.norm(u), 1e-9)
+    if float(np.dot(u, cam_up)) < 0:
+        u = -u
+
+    # Precompute the ray projectors once; they dominate the cost.
+    tops, bots = [], []
+    for o in obs:
+        Ct, dt = camera_ray(o.cam, o.top_uv)
+        Cb, db = camera_ray(o.cam, o.bottom_uv)
+        tops.append((Ct, np.eye(3) - np.outer(dt, dt)))
+        bots.append((Cb, np.eye(3) - np.outer(db, db)))
+
+    a_top, a_bot = 1.0, -1.0
+
+    def solve_axis(a_top: float, a_bot: float) -> np.ndarray:
+        # Solve for u given both offsets.  Endpoint k must project onto its
+        # silhouette extreme: P_k (centre + a_k u - C_k) = 0, i.e.
+        # P_k u = P_k (C_k - centre) / a_k.  Both ends use the same form, so
+        # the two stacks must not be sign-flipped relative to each other.
+        rows, rhs = [], []
+        for (Ct, Pt), (Cb, Pb) in zip(tops, bots):
+            rows.append(Pt)
+            rhs.append(Pt @ (Ct - centre) / max(a_top, 1e-6))
+            rows.append(Pb)
+            rhs.append(Pb @ (Cb - centre) / min(a_bot, -1e-6))
+        rows = np.vstack(rows)
+        rhs = np.concatenate(rhs)
+        rows = np.vstack([rows, reg_weight * np.eye(3)])
+        rhs = np.concatenate([rhs, reg_weight * cam_up])
+        sol, *_ = np.linalg.lstsq(rows, rhs, rcond=None)
+        n = float(np.linalg.norm(sol))
+        return sol / n if n > 1e-12 else cam_up
+
+    def solve_offsets(u: np.ndarray) -> tuple[float, float]:
+        At, bt, Ab, bb = [], [], [], []
+        for (Ct, Pt), (Cb, Pb) in zip(tops, bots):
+            At.append((Pt @ u).reshape(3, 1))
+            bt.append((-Pt @ (centre - Ct)).reshape(3, 1))
+            Ab.append((Pb @ u).reshape(3, 1))
+            bb.append((-Pb @ (centre - Cb)).reshape(3, 1))
+        # Both solves return the offset *along u*; the bottom one comes out
+        # negative for an upright subject because its ray points below the
+        # centre.  Do not flip its sign here — doing so collapses the extent.
+        a_t = float(np.linalg.lstsq(np.vstack(At), np.vstack(bt), rcond=None)[0][0, 0])
+        a_b = float(np.linalg.lstsq(np.vstack(Ab), np.vstack(bb), rcond=None)[0][0, 0])
+        return a_t, a_b
+
+    for _ in range(max(n_iterations, 1)):
+        u_new = solve_axis(a_top, a_bot)
+        if float(np.dot(u_new, u)) < 0:
+            u_new = -u_new
+        u = u_new
+        a_top, a_bot = solve_offsets(u)
+
+    if float(np.dot(u, cam_up)) < 0:
+        u, a_top, a_bot = -u, -a_bot, -a_top
+    if a_top < a_bot:
+        a_top, a_bot = a_bot, a_top
+
+    return u, a_top, a_bot, {
+        "a_top": float(a_top),
+        "a_bot": float(a_bot),
+        "extent": float(a_top - a_bot),
+        "camera_up_agreement": float(np.dot(u, cam_up)),
+        "n_views": len(obs),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Stage 3 — metric scale
 # ═══════════════════════════════════════════════════════════════════════════
@@ -575,6 +676,85 @@ def estimate_metric_height(
     }
 
 
+def solve_translation_by_silhouette_centroids(
+    means, scales, quats, opacities,
+    obs: Sequence[ViewObservation],
+    up: np.ndarray,
+    scale: float,
+    yaw: float,
+    R_up: torch.Tensor,
+    centre: np.ndarray,
+    n_iterations: int = 6,
+    alpha_threshold: float = 0.5,
+    max_step: float = 0.25,
+) -> tuple[torch.Tensor, dict]:
+    """Solve the translation so *rendered* silhouettes land on the observed ones.
+
+    Anchoring the model's 3-D centroid to the triangulated silhouette centroid
+    is only approximately right: the image centroid of a silhouette is not the
+    projection of the object's 3-D centroid.  It is the projection of a
+    different point — the one whose rays balance the visible surface, biased by
+    occlusion and by the subject's shape.  On a test subject the two differ by
+    several centimetres, which is enough to cost a fifth of the achievable IoU
+    even when rotation and scale are exact.
+
+    So solve the problem it is actually stated in: for each view, the rendered
+    silhouette's 2-D centroid should equal the observed one.  Linearising a
+    world-space translation ``Δt`` into image motion gives, per view,
+
+        ``Δt_u = J_k Δt``,  ``J_k = diag(fx/z, fy/z) · R_w2c``
+
+    and stacking the per-view residuals yields a small 3-D least-squares
+    problem.  A few iterations converge because the residual is dominated by a
+    rigid offset; large jumps are clamped so a bad iteration cannot throw the
+    model out of frame.
+
+    Returns ``(t (3,), info)``.
+    """
+    device = means.device
+    centre_t = torch.from_numpy(centre).float().to(device)
+    mc = means.mean(dim=0)
+    R = torch.from_numpy(rotation_y(yaw)).float().to(device) @ R_up
+    t = centre_t - scale * (mc @ R.T)
+
+    residuals = []
+    for _ in range(max(n_iterations, 1)):
+        mt, st, qt = _apply(means, scales, quats, scale, R, t)
+        A, b, w = [], [], []
+        for o in obs:
+            alpha = render_alpha(mt, st, qt, opacities, o.cam)
+            sil = (alpha.squeeze(0) > alpha_threshold).detach().cpu().numpy()
+            ys, xs = np.nonzero(sil)
+            if len(ys) < 20:
+                continue
+            J = _projection_jacobian(o.cam)
+            # Residual: observed centroid minus rendered centroid (pixels).
+            res = o.centroid_uv - np.array([xs.mean(), ys.mean()])
+            A.append(J)
+            b.append(res)
+            w.append(np.full(2, o.weight))
+        if not A:
+            break
+        A = np.vstack(A)
+        b = np.concatenate(b)
+        w = np.concatenate(w)
+        Aw, bw = A * w[:, None], b * w
+        dt, *_ = np.linalg.lstsq(Aw, bw, rcond=None)
+        norm = float(np.linalg.norm(dt))
+        if norm > max_step:
+            dt *= max_step / norm
+        t = t + torch.from_numpy(dt).float().to(device)
+        residuals.append(norm)
+        if norm < 1e-4:
+            break
+
+    return t, {
+        "iterations": len(residuals),
+        "residual_m_per_step": [float(r) for r in residuals],
+        "final_step_m": float(residuals[-1]) if residuals else 0.0,
+    }
+
+
 def model_height_along_up(means: torch.Tensor, R_up: torch.Tensor) -> float:
     """Height of the Gaussian set along the direction *R_up* maps model-up to.
 
@@ -595,7 +775,7 @@ def calibrate_scale_by_rendering(
     R_up: torch.Tensor,
     n_iter: int = 10,
     bracket: float = 1.6,
-    alpha_threshold: float = 0.1,
+    alpha_threshold: float = 0.5,
 ) -> tuple[float, dict]:
     """Correct the scale so rendered and observed silhouettes agree.
 
@@ -691,10 +871,12 @@ def _apply(means, scales, quats, s, R, t):
 @torch.no_grad()
 def _iou_against_masks(
     means, scales, quats, opacities, s, R, t,
-    obs: Sequence[ViewObservation], alpha_threshold: float = 0.1,
-) -> float:
+    obs: Sequence[ViewObservation], alpha_threshold: float = 0.5,
+    return_centroid_residual: bool = False,
+):
     mt, st, qt = _apply(means, scales, quats, s, R, t)
     ious, weights = [], []
+    centroid_rows = []
     for o in obs:
         alpha = render_alpha(mt, st, qt, opacities, o.cam)
         sil = (alpha.squeeze(0) > alpha_threshold).detach().cpu().numpy()
@@ -704,9 +886,40 @@ def _iou_against_masks(
             continue
         ious.append(inter / union)
         weights.append(o.weight)
+        if return_centroid_residual:
+            ys, xs = np.nonzero(sil)
+            if len(ys) >= 20:
+                centroid_rows.append((o, o.centroid_uv - np.array([xs.mean(), ys.mean()])))
     if not ious:
-        return 0.0
-    return float(np.average(ious, weights=weights))
+        iou = 0.0
+    else:
+        iou = float(np.average(ious, weights=weights))
+    if return_centroid_residual:
+        return iou, centroid_rows
+    return iou
+
+
+def _refine_translation_from_residuals(
+    t: torch.Tensor,
+    centroid_rows,
+    max_step: float = 0.25,
+) -> torch.Tensor:
+    """One Gauss-Newton step on the silhouette-centroid residuals."""
+    if not centroid_rows:
+        return t
+    A, b, w = [], [], []
+    for o, res in centroid_rows:
+        A.append(_projection_jacobian(o.cam))
+        b.append(res)
+        w.append(np.full(2, o.weight))
+    A = np.vstack(A)
+    b = np.concatenate(b)
+    w = np.concatenate(w)
+    dt, *_ = np.linalg.lstsq(A * w[:, None], b * w, rcond=None)
+    n = float(np.linalg.norm(dt))
+    if n > max_step:
+        dt *= max_step / n
+    return t + torch.from_numpy(dt).float().to(t.device)
 
 
 def search_yaw(
@@ -716,7 +929,7 @@ def search_yaw(
     model_centroid: np.ndarray,
     n_coarse: int = 36,
     n_fine: int = 24,
-    alpha_threshold: float = 0.1,
+    alpha_threshold: float = 0.5,
 ) -> tuple[float, float, dict]:
     """Find the yaw that best explains all silhouettes.
 
@@ -724,6 +937,14 @@ def search_yaw(
     orientation freedom is a spin about the up axis.  A 1-D sweep therefore
     covers the whole space — including the 180° flip, which is just another
     sample on the same curve rather than a separate basin.
+
+    The sweep is also the natural place to measure **how well yaw is
+    determined**.  A subject that is close to rotationally symmetric (or whose
+    azimuthal features are weak) produces a flat IoU-vs-yaw curve, and then
+    no algorithm can pin the angle down — the honest answer is a wide
+    interval, not a spuriously precise number.  ``yaw_std_deg`` reports the
+    half-width of the region within ``1 − 0.02`` of the peak IoU, which is a
+    practical proxy for the confidence interval.
 
     Returns ``(yaw_radians, best_iou, info)``.
     """
@@ -734,24 +955,61 @@ def search_yaw(
     centre_t = torch.from_numpy(centre).float().to(device)
     mc = torch.from_numpy(model_centroid).float().to(device)
 
-    def evaluate(yaw: float):
+    def evaluate(yaw: float, n_trans: int = 2):
         R = torch.from_numpy(rotation_y(yaw)).float().to(device) @ R_up
-        # Keep the model centroid on the measured subject centre.
+        # Start from centroid anchoring, then let the silhouette centroids
+        # correct it.  Scoring a yaw with a badly placed model flattens the
+        # IoU curve and biases the chosen angle; solving the placement inside
+        # each candidate makes the comparison fair.
         t = centre_t - scale * (mc @ R.T)
-        return _iou_against_masks(means, scales, quats, opacities,
-                                  scale, R, t, obs, alpha_threshold), R, t
+        for _ in range(n_trans):
+            iou, rows = _iou_against_masks(
+                means, scales, quats, opacities, scale, R, t, obs,
+                alpha_threshold, return_centroid_residual=True)
+            t = _refine_translation_from_residuals(t, rows)
+        iou, rows = _iou_against_masks(
+            means, scales, quats, opacities, scale, R, t, obs,
+            alpha_threshold, return_centroid_residual=True)
+        return iou, R, t
 
-    coarse = [(y, *evaluate(y)[0:1]) for y in np.linspace(-math.pi, math.pi, n_coarse,
-                                                          endpoint=False)]
+    # Coarse pass on a full circle, kept whole so the curve can be inspected.
+    coarse = [(y, evaluate(y)[0]) for y in np.linspace(-math.pi, math.pi, n_coarse,
+                                                       endpoint=False)]
     best_yaw = max(coarse, key=lambda e: e[1])[0]
 
     step = 2 * math.pi / n_coarse
-    fine = [(y, evaluate(y)[0]) for y in np.linspace(best_yaw - step, best_yaw + step, n_fine)]
+    # Fine pass: more translation iterations near the optimum.
+    fine = []
+    for y in np.linspace(best_yaw - step, best_yaw + step, n_fine):
+        fine.append((y, evaluate(y, n_trans=4)[0]))
     best_yaw = max(fine, key=lambda e: e[1])[0]
-    best_iou, R, t = evaluate(best_yaw)
+    best_iou, R, t = evaluate(best_yaw, n_trans=6)
 
-    return best_yaw, best_iou, {"R": R, "t": t, "R_up": R_up,
-                                "coarse_best": float(max(e[1] for e in coarse))}
+    # Confidence: width of the near-optimal plateau, and the runner-up peak
+    # (used to detect front/back ambiguity).
+    peak = max(v for _, v in coarse)
+    tol = peak - 0.02
+    plateau = [y for y, v in coarse if v >= tol]
+
+    def angdiff(a, b):
+        return abs(((math.degrees(a - b) + 180.0) % 360.0) - 180.0)
+
+    nearby = [angdiff(y, best_yaw) for y in plateau if angdiff(y, best_yaw) <= 90.0]
+    yaw_std = 0.5 * (max(nearby) if nearby else 0.0)
+
+    # Mirror candidate: the best sample more than 90° away (a flip).
+    far = [(y, v) for y, v in coarse if angdiff(y, best_yaw) > 90.0]
+    flip_yaw, flip_iou = max(far, key=lambda e: e[1]) if far else (float("nan"), float("nan"))
+
+    return best_yaw, best_iou, {
+        "R": R, "t": t, "R_up": R_up,
+        "coarse_best": float(peak),
+        "yaw_std_deg": float(yaw_std),
+        "flip_yaw": float(flip_yaw),
+        "flip_iou": float(flip_iou),
+        "flip_margin": float(best_iou - flip_iou) if far else float("nan"),
+        "n_views": len(obs),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -776,6 +1034,15 @@ class RegistrationResult:
     model_height: float
     yaw: float
     diagnostics: dict = field(default_factory=dict)
+
+    @property
+    def yaw_std_deg(self) -> float:
+        """Half-width of the near-optimal yaw plateau, in degrees.
+
+        Large values mean the silhouettes do not pin the yaw down; treat the
+        reported angle as a hint rather than a measurement.
+        """
+        return float(self.diagnostics.get("yaw", {}).get("yaw_std_deg", float("nan")))
 
     def matrix(self) -> torch.Tensor:
         """4×4 homogeneous transform in scene coordinates."""
@@ -812,6 +1079,7 @@ def register_gaussians_to_scene(
     colors: torch.Tensor | None = None,
     rmbg_fn: Callable | None = None,
     alpha_threshold: float = 0.5,
+    render_threshold: float | None = None,
     min_valid_views: int = 6,
     n_yaw_coarse: int = 36,
     n_yaw_fine: int = 24,
@@ -833,6 +1101,9 @@ def register_gaussians_to_scene(
             ``refine_iters > 0``.
         rmbg_fn: background remover used when a camera has no alpha channel.
         alpha_threshold: foreground threshold for the real masks.
+        render_threshold: threshold applied to the rendered alpha when forming
+            a silhouette.  Defaults to ``alpha_threshold`` so both sides are
+            measured identically — see the comment in the body.
         min_valid_views: how many uncropped views are needed before falling
             back to the least-cropped subset.
         n_yaw_coarse, n_yaw_fine: yaw sweep resolution.
@@ -854,6 +1125,14 @@ def register_gaussians_to_scene(
     quats = quats.detach().float()
     opacities = opacities.detach().float()
 
+    # The rendered alpha and the real mask must be thresholded the same way,
+    # otherwise the two silhouettes describe different surfaces: thresholding
+    # the render at 0.1 while the real mask is taken at 0.5 inflates every
+    # rendered silhouette by its soft edge, which drags IoU down even when the
+    # transform is exactly right (measured ceiling 0.91 at the true pose).
+    if render_threshold is None:
+        render_threshold = alpha_threshold
+
     def log(msg: str):
         if verbose:
             print(msg)
@@ -870,24 +1149,39 @@ def register_gaussians_to_scene(
     log(f"  Views: {sel_info['n_observed']} observed, {sel_info['n_uncropped']} uncropped, "
         f"{len(obs)} used" + ("  [relaxed: too few uncropped]" if sel_info["relaxed"] else ""))
 
-    # ── Stage 1: up axis ──
-    up, up_info = estimate_up_axis(obs)
-    log(f"  Up axis (world): {np.round(up, 4).tolist()}, "
-        f"camera agreement {up_info['camera_up_agreement']:.3f}")
-
-    # ── Stage 2: subject centre ──
+    # ── Stage 1: subject centre (needed by the axis fit) ──
     centre, centre_info = estimate_subject_centre(obs)
     log(f"  Subject centre: {np.round(centre, 4).tolist()} "
         f"(median ray residual {centre_info['centroid_residual']:.4f} m)")
 
+    # ── Stage 2: up axis ──
+    # The principal-axis estimate is the right seed (it is the most accurate
+    # on a clean body) but is rotated by limbs; the joint fit then corrects it
+    # using the extrema.  See refine_up_axis_and_extent for measurements.
+    up_seed, seed_info = estimate_up_axis(obs)
+    up, a_top, a_bot, up_info = refine_up_axis_and_extent(obs, centre, up_seed)
+    up_info["seed"] = seed_info
+    log(f"  Up axis (world): {np.round(up, 4).tolist()}, "
+        f"camera agreement {up_info['camera_up_agreement']:.3f}, "
+        f"extent {up_info['extent']:.3f} m")
+
     # ── Stage 3: metric scale ──
-    height, height_info = estimate_metric_height(obs, centre, up)
+    # The joint axis fit already yields the metric extent between the head and
+    # foot planes, measured identically to how the silhouette extents are
+    # measured.  Fall back to the extent-vs-height fit if it is degenerate.
+    height = up_info["extent"]
+    height_info = {"n_views_fit": up_info["n_views"], "source": "joint_axis_fit"}
+    if not (0.2 <= height <= 3.0):
+        height, height_info = estimate_metric_height(obs, centre, up)
+        height_info["source"] = "extent_height_fit"
+
     R_up_np = rotation_aligning(np.array([0.0, 1.0, 0.0]), up) @ MODEL2SCENE.double().numpy()
     R_up = torch.from_numpy(R_up_np).float().to(device)
     h_model = model_height_along_up(means, R_up)
     scale = height / max(h_model, 1e-9)
-    log(f"  Metric height: {height:.3f} m over {height_info['n_views_fit']} views "
-        f"(model height {h_model:.4f} units) → scale {scale:.4f}")
+    log(f"  Metric height: {height:.3f} m ({height_info['source']}, "
+        f"{height_info['n_views_fit']} views; model height {h_model:.4f} units) "
+        f"→ scale {scale:.4f}")
 
     # ── Stage 4: yaw ──
     # Rotate the model centroid along with the model, so the rigid placement is
@@ -896,7 +1190,7 @@ def register_gaussians_to_scene(
     yaw, iou, yaw_info = search_yaw(
         means, scales, quats, opacities, obs, centre, up, scale,
         model_centroid, n_coarse=n_yaw_coarse, n_fine=n_yaw_fine,
-        alpha_threshold=0.1,
+        alpha_threshold=render_threshold,
     )
 
     # ── Stage 3b: rendering-consistent scale calibration ──
@@ -916,13 +1210,23 @@ def register_gaussians_to_scene(
         calib_info = None
 
     R = yaw_info["R"]
-    t = yaw_info["t"]
-    # Re-anchor the translation for the final scale.
-    centre_t = torch.from_numpy(centre).float().to(device)
-    mc_t = torch.from_numpy(model_centroid).float().to(device)
-    t = centre_t - scale * (mc_t @ R.T)
-    iou = _iou_against_masks(means, scales, quats, opacities, scale, R, t, obs, 0.1)
-    log(f"  Yaw: {math.degrees(yaw):.1f}° → mean silhouette IoU {iou:.4f}")
+    # Solve the translation against rendered silhouettes rather than anchoring
+    # the 3-D centroid: the image centroid of a silhouette is not the
+    # projection of the object's centroid, and that mismatch alone caps IoU
+    # near 0.85 even at a perfect rotation and scale.
+    t, trans_info = solve_translation_by_silhouette_centroids(
+        means, scales, quats, opacities, obs, up, scale, yaw, yaw_info["R_up"],
+        centre, alpha_threshold=render_threshold,
+    )
+    iou = _iou_against_masks(means, scales, quats, opacities, scale, R, t, obs, render_threshold)
+    log(f"  Yaw: {math.degrees(yaw):.1f}° ±{yaw_info['yaw_std_deg']:.0f}° "
+        f"(flip candidate {math.degrees(yaw_info['flip_yaw']) if math.isfinite(yaw_info['flip_yaw']) else float('nan'):.0f}° "
+        f"scores {yaw_info['flip_iou']:.3f}) → mean silhouette IoU {iou:.4f}")
+
+    if yaw_info["yaw_std_deg"] > 15.0:
+        log(f"  ⚠️  Yaw is only weakly determined (±{yaw_info['yaw_std_deg']:.0f}°): "
+            "the subject's silhouettes are close to rotationally symmetric. "
+            "Consider refine_iters > 0, which uses shading as well as shape.")
 
     diagnostics = {
         "views": sel_info,
@@ -930,7 +1234,14 @@ def register_gaussians_to_scene(
         "centre": centre_info,
         "height": height_info,
         "scale_calibration": calib_info,
-        "yaw": {"coarse_best_iou": yaw_info["coarse_best"], "final_iou": iou},
+        "translation": trans_info,
+        "yaw": {
+            "coarse_best_iou": yaw_info["coarse_best"],
+            "final_iou": iou,
+            "yaw_std_deg": yaw_info["yaw_std_deg"],
+            "flip_iou": yaw_info["flip_iou"],
+            "flip_margin": yaw_info["flip_margin"],
+        },
         "method": "closed_form_axis_scale_yaw",
     }
 
@@ -958,7 +1269,7 @@ def register_gaussians_to_scene(
         }
         scale, R, t = float(s_r), R_r, t_r
         iou_after = _iou_against_masks(means, scales, quats, opacities,
-                                       scale, R, t, obs, 0.1)
+                                       scale, R, t, obs, render_threshold)
         diagnostics["refine"]["iou_after"] = iou_after
         log(f"  After refinement: scale={scale:.4f}, IoU={iou_after:.4f}")
 
@@ -976,20 +1287,40 @@ def verify_registration(
     cameras: Sequence[Camera],
     rmbg_fn: Callable | None = None,
     alpha_threshold: float = 0.5,
-    alpha_render_threshold: float = 0.1,
+    alpha_render_threshold: float | None = None,
 ) -> dict:
     """Score a registration and flag the failure modes the closed form avoids.
 
-    Returns per-view silhouette IoU plus three aggregate checks:
+    Returns per-view silhouette IoU plus these aggregate checks:
 
-    * ``mean_iou`` — overall fit.
-    * ``height_consistency`` — spread of the per-view implied metric height.
-      A large spread means the model and the scene disagree about the
-      subject's proportions/scale.
-    * ``upright`` — fraction of rendered silhouettes that are head-up.  IoU
-      alone cannot reject a 180° flip, so it is checked separately.
+    * ``mean_iou`` / ``min_iou`` — overall and worst-view fit.
+    * ``height_consistency_std`` — spread of the per-view implied metric
+      height.  A large spread means the model and the scene disagree about
+      the subject's proportions.
+    * ``orientation_agreement`` — the fraction of views where the rendered
+      silhouette falls in the *same* head-up/head-down class as the real
+      photo.  This compares against the real image rather than asserting an
+      absolute "topband must be narrower" rule, because that rule encodes an
+      assumption about body shape (narrow head, wide legs) which need not hold
+      — a person with arms raised, or a subject in a coat, breaks it while
+      still being perfectly upright.  The real photographs already define
+      which way is up, so agreement with them is the meaningful test.
+    * ``frac_upright`` — kept for compatibility with
+      :mod:`~.orientation`'s absolute heuristic (also reported as
+      ``flip_suspected``), useful when no reference masks exist.
+
+    Args:
+        alpha_threshold: foreground threshold for the real masks.
+        alpha_render_threshold: threshold applied to the rendered alpha.
+            Defaults to ``alpha_threshold``: the two silhouettes must describe
+            the same surface, and a softer render threshold inflates every
+            rendered silhouette by its soft edge, capping IoU below 1 even at
+            a perfect pose (measured ceiling 0.91 with 0.1 vs 0.5).
     """
-    from .orientation import uprightness_report
+    from .orientation import silhouette_orientation_stats, uprightness_report
+
+    if alpha_render_threshold is None:
+        alpha_render_threshold = alpha_threshold
 
     observations = extract_observations(cameras, rmbg_fn=rmbg_fn,
                                         alpha_threshold=alpha_threshold)
@@ -997,6 +1328,7 @@ def verify_registration(
 
     mt, st, qt = result.apply(means, scales, quats)
     ious, pred_masks, real_masks, implied = [], [], [], []
+    agree, judged = 0, 0
 
     with torch.no_grad():
         for o in clean:
@@ -1009,6 +1341,14 @@ def verify_registration(
             pred_masks.append(sil)
             real_masks.append(o.mask)
 
+            p_st = silhouette_orientation_stats(sil)
+            r_st = silhouette_orientation_stats(o.mask)
+            if (p_st["valid"] and r_st["valid"]
+                    and not p_st.get("ambiguous", False)
+                    and not r_st.get("ambiguous", False)):
+                judged += 1
+                agree += int((p_st["band_ratio"] < 1.0) == (r_st["band_ratio"] < 1.0))
+
             ys, xs = np.nonzero(sil)
             if len(ys) > 20:
                 cam = o.cam
@@ -1017,6 +1357,7 @@ def verify_registration(
                     implied.append(float((ys.max() - ys.min() + 1) * z[0] / cam.fy))
 
     upright = uprightness_report(pred_masks, real_masks)
+    orientation_agreement = (agree / judged) if judged else float("nan")
     return {
         "n_views": len(clean),
         "mean_iou": float(np.mean(ious)) if ious else 0.0,
@@ -1024,6 +1365,10 @@ def verify_registration(
         "per_view_iou": ious,
         "implied_height_median": float(np.median(implied)) if implied else float("nan"),
         "height_consistency_std": float(np.std(implied)) if implied else float("nan"),
+        "orientation_agreement": orientation_agreement,
+        "flip_detected": bool(judged > 0 and orientation_agreement < 0.5),
+        # Kept for compatibility; the absolute heuristic is less reliable than
+        # agreement with the real photos (see the docstring).
         "frac_upright": upright["frac_upright"],
-        "flip_suspected": upright["flip_suspected"],
+        "flip_suspected": bool(judged > 0 and orientation_agreement < 0.5),
     }

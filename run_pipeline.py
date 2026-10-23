@@ -163,13 +163,6 @@ def step2_align(args):
     scales_aligned_raw = scales_raw + math.log(scale)
     q_total = rotation_matrix_to_quaternion(R)
     quats_aligned = quaternion_compose(q_total, quats)
-    # means.  Total: xyz_scene = scale * (R @ means_scene) + t
-    # which is equivalent to: scale * (R @ R_model2scene @ means_orig) + t
-    means_aligned = scale * (means_scene @ R.T) + t
-    scales_aligned_raw = scales_raw + math.log(scale)
-    R_total = R @ R_model2scene  # model → scene
-    q_total = rotation_matrix_to_quaternion(R_total)
-    quats_aligned = quaternion_compose(q_total, quats)
 
     print(f"\n  Final: scale={scale:.4f}")
     print(f"  Aligned means range: [{means_aligned.min():.3f}, {means_aligned.max():.3f}]")

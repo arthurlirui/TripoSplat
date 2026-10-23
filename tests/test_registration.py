@@ -258,14 +258,47 @@ def test_registration_recovers_synthetic_transform():
     torch.manual_seed(0)
 
     # A crude "person" in the TripoSplat **model** frame: elongated along the
-    # model's up axis, which is +Z (see coord_registry.MODEL2SCENE).
-    N = 3000
-    pts = torch.randn(N, 3) * torch.tensor([0.25, 0.25, 1.0])
-    pts = torch.clamp(pts, -0.5, 0.5)
-    means = pts
-    scales = torch.full((N, 3), 0.015)
-    quats = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(N, 1)
-    opac = torch.full((N,), 0.95)
+    # model's up axis, which is +Z (see coord_registry.MODEL2SCENE).  Three
+    # properties are needed for the test to be meaningful:
+    #   * taper (narrow head at +z, wide legs at -z) — otherwise the
+    #     uprightness gate has no asymmetry to judge;
+    #   * an elliptical cross-section — a rotationally symmetric body makes
+    #     yaw genuinely unidentifiable;
+    #   * pronounced front-facing and lateral structure (a nose/chest bump and
+    #     arms) — an axisymmetric body is invariant under a 180° spin, and a
+    #     nearly symmetric one leaves the yaw objective so flat that the
+    #     answer is only defined to tens of degrees.  Yaw accuracy is
+    #     physically limited by the subject's azimuthal asymmetry, so the
+    #     fixture must supply enough of it to be testable.
+    N = 4000
+    z = torch.rand(N) - 0.5                      # full body: z in [-0.5, 0.5]
+    r = 0.03 + 0.09 * (0.5 - z)                  # narrow at +z (head)
+    theta = torch.rand(N) * 2 * math.pi
+    xy = torch.stack([torch.cos(theta) * r, torch.sin(theta) * r * 0.45], dim=1)
+    torso = torch.cat([xy, z[:, None]], dim=1)
+
+    # Nose / chest: a nose-like spike on +Y in the upper body.
+    M = 1600
+    zf = 0.10 + 0.38 * torch.rand(M)
+    nose = torch.stack([
+        0.02 * torch.randn(M),
+        0.10 + 0.16 * torch.rand(M),
+        zf,
+    ], dim=1)
+
+    # Arms: two lateral masses spread along ±X at shoulder height.
+    A = 1400
+    side = torch.where(torch.rand(A) < 0.5, -1.0, 1.0)
+    arm = torch.stack([
+        side * (0.17 + 0.05 * torch.rand(A)),
+        0.015 * torch.randn(A),
+        0.05 + 0.30 * torch.rand(A),
+    ], dim=1)
+
+    means = torch.cat([torso, nose, arm], dim=0)
+    scales = torch.full((means.shape[0], 3), 0.015)
+    quats = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(means.shape[0], 1)
+    opac = torch.full((means.shape[0],), 0.95)
 
     s_true, yaw_true = 1.4, math.radians(-70.0)
     R_true = (torch.from_numpy(rotation_y(yaw_true)).float().to(dev)
@@ -290,8 +323,12 @@ def test_registration_recovers_synthetic_transform():
     assert res.scale == pytest.approx(s_true, rel=0.08), f"scale {res.scale} vs {s_true}"
     yaw_err = abs(((math.degrees(res.yaw) - math.degrees(yaw_true) + 180) % 360) - 180)
     assert yaw_err < 10.0, f"yaw error {yaw_err:.1f} deg"
+    np.testing.assert_allclose(res.subject_centre, t_true.cpu().numpy(), atol=0.10)
 
     metrics = verify_registration(
         res, means.to(dev), scales.to(dev), quats.to(dev), opac.to(dev), cams)
     assert metrics["mean_iou"] > 0.8, metrics
-    assert not metrics["flip_suspected"], metrics
+    # Orientation must agree with the real (rendered-from-truth) photos in
+    # every judged view; this is the flip guard.
+    assert metrics["orientation_agreement"] > 0.8, metrics
+    assert not metrics["flip_detected"], metrics

@@ -26,6 +26,8 @@ so a threshold of 1.0 separates the two classes with a wide margin.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -72,12 +74,19 @@ def silhouette_orientation_stats(mask: np.ndarray) -> dict:
     else:
         ratio = top_ext / bot_ext
 
+    # A shape with equal top and bottom widths (a cylinder, a featureless
+    # blob, or a subject viewed along its axis) carries no vertical asymmetry,
+    # so it says nothing about orientation.  Such a mask must not be counted
+    # as "inverted" — that turns a non-verdict into a false alarm.
+    ambiguous = bool(math.isfinite(ratio) and abs(ratio - 1.0) < 0.10)
+
     return dict(
         band_ratio=float(ratio),
         top_runs=_num_runs(top[top.shape[0] // 2]),
         bot_runs=_num_runs(bot[bot.shape[0] // 2]),
         top_extent=top_ext,
         bot_extent=bot_ext,
+        ambiguous=ambiguous,
         valid=True,
     )
 
@@ -86,10 +95,11 @@ def is_upright(mask: np.ndarray, max_band_ratio: float = 1.0) -> bool:
     """Heuristic: is this standing-figure silhouette the right way up?
 
     A mask whose top band is wider than its bottom band is almost certainly
-    inverted (head-down).  Empty masks return ``True`` (nothing to judge).
+    inverted (head-down).  Empty masks and masks with no vertical asymmetry
+    return ``True`` — nothing to judge, so no accusation.
     """
     st = silhouette_orientation_stats(mask)
-    if not st["valid"]:
+    if not st["valid"] or st.get("ambiguous", False):
         return True
     return st["band_ratio"] < max_band_ratio
 
@@ -110,13 +120,14 @@ def uprightness_report(pred_masks: list[np.ndarray],
         inverted.
     """
     pred_stats = [silhouette_orientation_stats(m) for m in pred_masks]
-    judged = [s for s in pred_stats if s["valid"]]
+    judged = [s for s in pred_stats if s["valid"] and not s.get("ambiguous", False)]
     n_up = sum(1 for s in judged if s["band_ratio"] < max_band_ratio)
     frac_up = (n_up / len(judged)) if judged else float("nan")
 
     report = dict(
         n_views=len(pred_masks),
         n_judged=len(judged),
+        n_ambiguous=sum(1 for s in pred_stats if s.get("ambiguous", False)),
         frac_upright=float(frac_up),
         flip_suspected=bool(len(judged) > 0 and frac_up < 0.5),
         per_view_band_ratio=[s["band_ratio"] for s in pred_stats],
@@ -124,9 +135,10 @@ def uprightness_report(pred_masks: list[np.ndarray],
 
     if real_masks is not None:
         ref = [silhouette_orientation_stats(m) for m in real_masks]
+        ref_judged = [s for s in ref if s["valid"] and not s.get("ambiguous", False)]
         report["real_frac_upright"] = float(
-            np.mean([s["band_ratio"] < max_band_ratio for s in ref if s["valid"]])
-        ) if any(s["valid"] for s in ref) else float("nan")
+            np.mean([s["band_ratio"] < max_band_ratio for s in ref_judged])
+        ) if ref_judged else float("nan")
 
     return report
 
