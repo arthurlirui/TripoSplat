@@ -126,6 +126,7 @@ def step2_align(args):
     # transforms_{val,test}.json, not transforms_train.json.  Search every
     # split so the documented --init_view 00.png actually works.
     init_cam = None
+    init_split_file = "unknown"
     for _split in ("val", "test", "train"):
         _p = re.sub(r"transforms_(train|val|test)\.json$", f"transforms_{_split}.json",
                     args.transforms)
@@ -134,7 +135,8 @@ def step2_align(args):
         try:
             _cams = load_cameras(_p, device=args.device, image_scale=0.25, load_image=True)
             init_cam = find_camera_by_filename(_cams, args.init_view)
-            print(f"  Init camera: {os.path.basename(_p)} cam_idx={init_cam.cam_idx}, "
+            init_split_file = os.path.basename(_p)
+            print(f"  Init camera: {init_split_file} cam_idx={init_cam.cam_idx}, "
                   f"position={init_cam.position.tolist()}")
             break
         except ValueError:
@@ -173,14 +175,23 @@ def step2_align(args):
     save_gaussians_ply(ply_path, means_aligned, scales_aligned_raw, quats_aligned,
                        opacities_raw, sh0, shN)
 
-    params = {
-        'scale': float(scale), 'rotation': R.cpu().numpy().tolist(),
-        'translation': t.cpu().numpy().tolist(),
-        'init_view': args.init_view,
-        'method': 'analytic_init_view',
-    }
-    with open(os.path.join(args.output_dir, "alignment_params.json"), 'w') as f:
-        json.dump(params, f, indent=2)
+    # One self-describing, validated transform file.  Everything needed to
+    # reproduce this alignment — including which view anchored it and how well
+    # it scored — lives here, so a later stage never has to guess.
+    from multiview_refine.transform_io import GaussianTransform, save_transform
+
+    subject_h = float(means_aligned[:, 1].max() - means_aligned[:, 1].min())
+    tfm = GaussianTransform.from_align(
+        scale, R, t,
+        name="analytic_init_view",
+        init_view=args.init_view,
+        init_camera_position=init_cam.position,
+        metrics={"subject_height_m": subject_h},
+        notes=f"aligned from {init_split_file}; source PLY {args.input_ply}",
+    )
+    tfm_path = save_transform(os.path.join(args.output_dir, "alignment_transform.json"), tfm)
+    print(f"  Transform: {tfm.summary()}")
+    print(f"  Saved {tfm_path}")
     print(f"\n  Saved {ply_path}")
     print(f"Step 2 complete.")
 

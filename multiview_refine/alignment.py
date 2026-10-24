@@ -509,6 +509,14 @@ def align_from_init_view(
         app_px = float(init_camera.height)
 
     # app_px = fy * (s * model_h) / distance  =>  s = app_px * distance / (fy * model_h)
+    #
+    # The ratio app_px/fy is what matters, and both scale with the image
+    # resolution, so ``s`` is resolution-independent in principle.  In practice
+    # ``app_px`` comes from a mask whose edges move by up to a pixel and ``fy``
+    # is rounded, so different ``image_scale`` values shift ``s`` slightly
+    # (measured: 1.76928 at 0.25 vs 1.76597 at 0.5 on static/000001, ~0.19%).
+    # That is well below the alignment tolerance, but callers persisting the
+    # transform should record ``image_scale`` so two runs can be compared.
     scale = app_px * distance / (init_camera.fy * max(model_h, 1e-6))
 
     # ── Translation: land the subject on the init view's pixel centroid ──

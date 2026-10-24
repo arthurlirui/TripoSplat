@@ -36,6 +36,12 @@ from .registration import (
     register_gaussians_to_scene,
     verify_registration,
 )
+from .transform_io import (
+    GaussianTransform,
+    save_transform,
+    load_transform,
+    convert_ply,
+)
 
 __all__ = [
     "Camera",
@@ -69,4 +75,8 @@ __all__ = [
     "RegistrationResult",
     "register_gaussians_to_scene",
     "verify_registration",
+    "GaussianTransform",
+    "save_transform",
+    "load_transform",
+    "convert_ply",
 ]
