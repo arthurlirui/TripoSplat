@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import math
@@ -60,6 +61,14 @@ def main():
                         help='Number of nearest SMPL vertices for weight init.')
     parser.add_argument('--temperature', type=float, default=0.05,
                         help='Softmax temperature for distance weighting.')
+    parser.add_argument('--up_axis', default=None,
+                        help='Explicit "x,y,z" up direction in scene coordinates. '
+                             'Skips up-axis estimation; use when the subject is '
+                             'not standing.')
+    parser.add_argument('--smpl_transform', default=None,
+                        help='JSON from transform_io, used instead of fitting.')
+    parser.add_argument('--fit_samples', type=int, default=20000,
+                        help='Gaussian points used for the body fit.')
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
 
@@ -84,36 +93,43 @@ def main():
 
     # ── 3. Rig: bind Gaussians to SMPL ──
     print(f"\n{'=' * 60}")
-    print("Step 3: Rig Gaussians to SMPL skeleton")
+    print("Step 3: Fit SMPL to the Gaussians and rig")
     print("=" * 60)
     from skinned_gaussian.rigging import rig_gaussians_to_smpl
+    from skinned_gaussian.alignment import (
+        align_body_model_to_gaussians,
+        fit_body_to_gaussians,
+    )
 
-    # We need to align the SMPL model to the Gaussian coordinate system.
-    # After multi-view refinement, Gaussians are in the Y-up scene world frame
-    # (SfM produces Y-up; cameras.py converts only the camera basis to OpenCV,
-    # not the world).  SMPL's native frame is also Y-up, so no rotation is
-    # needed — only scale + translation.
-    # (In a real pipeline, you'd fit SMPL to the images first, but for
-    #  this demo we just use the Gaussian centroid and scale.)
+    # Place the skeleton inside the cloud by fitting it, rather than guessing
+    # a scale from the raw Y extent.  A cloud in the TripoSplat model frame is
+    # Z-up, so a Y-extent guess both shrinks and tips the skeleton over.
+    if args.smpl_transform:
+        from multiview_refine.transform_io import load_transform
+        tf = load_transform(args.smpl_transform)
+        smpl.align_to_scene(scale=tf.scale, rotation=tf.R, transl=tf.t)
+        print(f"  Using supplied transform from {args.smpl_transform}")
+    else:
+        cams_for_fit = None
+        if args.transforms:
+            from multiview_refine.cameras import load_cameras
+            cams_for_fit = load_cameras(
+                args.transforms, device=args.device,
+                image_scale=0.25, load_image=False)
+        fit = fit_body_to_gaussians(
+            means, smpl, cameras=cams_for_fit,
+            up_axis=(np.array(args.up_axis.split(','), dtype=np.float64)
+                     if args.up_axis else None),
+            n_sample_scene=args.fit_samples,
+            verbose=True,
+        )
+        align_body_model_to_gaussians(smpl, fit)
+        # Persist the fit so a later run need not redo the search.
+        with open(os.path.join(args.output_dir, 'body_fit.json'), 'w') as f:
+            json.dump(fit.to_dict(), f, indent=2)
 
-    # Estimate SMPL placement: centroid and scale of the Gaussian cloud.
-    gc = means.median(0).values  # Gaussian centroid
-    # Compute actual SMPL rest-pose height from the mesh bounding box.
-    rest_verts, _ = smpl.get_rest_mesh()
-    smpl_height = (rest_verts[:, 1].max() - rest_verts[:, 1].min()).item()
-    # Both Gaussian cloud and SMPL are Y-up, so body height is along Y.
-    gs_height = (means[:, 1].max() - means[:, 1].min()).item()
-    smpl_scale = gs_height / smpl_height if smpl_height > 0.01 else 1.0
-
-    print(f"  Gaussian centroid: {gc.tolist()}")
-    print(f"  Gaussian height (Y range): {gs_height:.3f}")
-    print(f"  SMPL scale to fit: {smpl_scale:.3f}")
-
-    # Scale and translate SMPL rest mesh to match the Gaussian cloud.
-    # Both are Y-up, so no rotation is needed.  align_to_scene modifies smpl
-    # in-place.
-    smpl.align_to_scene(scale=smpl_scale, transl=gc)
-
+    # rig pose is measured automatically: the T-posed template must be posed
+    # like the subject (arms down) or the arm Gaussians fall onto torso bones.
     skinned = rig_gaussians_to_smpl(
         means, scales_raw, quats, opacities_raw, sh0,
         smpl, betas=torch.zeros(10, device=args.device),

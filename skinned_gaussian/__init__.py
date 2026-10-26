@@ -14,8 +14,15 @@ from .smplx_model import SMPLXWrapper
 from .skinning import lbs_deform_gaussians
 from .skinned_gaussians import SkinnedGaussians
 from .rigging import rig_gaussians_to_smpl, rig_gaussians_to_smplx
+from .alignment import (
+    BodyFitResult,
+    align_body_model_to_gaussians,
+    estimate_up_axis,
+    fit_body_to_gaussians,
+)
 from .pose_io import load_pose_sequence, generate_demo_poses, save_pose_sequence
 from .animation import render_animation, render_animation_comparison
+from . import joints
 
 __all__ = [
     "SMPLWrapper",
@@ -24,9 +31,14 @@ __all__ = [
     "SkinnedGaussians",
     "rig_gaussians_to_smpl",
     "rig_gaussians_to_smplx",
+    "BodyFitResult",
+    "align_body_model_to_gaussians",
+    "estimate_up_axis",
+    "fit_body_to_gaussians",
     "load_pose_sequence",
     "generate_demo_poses",
     "save_pose_sequence",
     "render_animation",
     "render_animation_comparison",
+    "joints",
 ]

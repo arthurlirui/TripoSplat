@@ -1,4 +1,9 @@
-"""SMPL pose parameter I/O and demo pose generation."""
+"""SMPL pose parameter I/O and demo pose generation.
+
+Poses are authored in the 63-dim shared body layout (joints 1..21, root
+excluded) so one sequence drives either skeleton.  ``match_body_pose`` is
+applied at consumption time to pad to SMPL's 69 dims.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,17 @@ import json
 import math
 import numpy as np
 import torch
+
+from .joints import (
+    BODY_POSE_DIM,
+    L_ELBOW,
+    L_SHOULDER,
+    R_ELBOW,
+    R_SHOULDER,
+    SPINE1,
+    SPINE2,
+    body_pose_slot,
+)
 
 
 def load_pose_sequence(path: str, device: str = 'cuda') -> dict:
@@ -79,28 +95,17 @@ def generate_demo_poses(
     # Time parameter.
     t = torch.linspace(0, 2 * math.pi, n_frames, device=dev)  # (n_frames,)
 
-    # Body pose: 23 joints × 3 = 69 params, all zeros initially.
-    # NOTE: body_pose excludes root (joint 0), so body_pose slot i ↔ SMPL joint i+1.
-    # To target SMPL joint j, index (j-1)*3 in the 69-vector.
-    # SMPL joints: 1=L_Hip, 2=R_Hip, 3=Spine1, 6=Spine2,
-    #   13=L_Shoulder, 14=L_Elbow, 16=R_Shoulder, 17=R_Elbow
-    body_pose = torch.zeros(n_frames, 69, device=dev)
+    # Body pose in the shared 63-dim layout (21 joints, root excluded).
+    # Authoring it here rather than per-skeleton means SMPL gets padded to 69
+    # at consumption time instead of SMPL-X receiving an over-long vector.
+    body_pose = torch.zeros(n_frames, BODY_POSE_DIM, device=dev)
 
-    # R_Shoulder (SMPL joint 16) → body_pose slot 15
-    body_pose[:, 15 * 3 + 0] = torch.sin(t) * 0.8   # R_Shoulder_X: arm raise
-    body_pose[:, 15 * 3 + 2] = torch.cos(t) * 0.3   # R_Shoulder_Z: arm rotation
-
-    # R_Elbow (SMPL joint 17) → body_pose slot 16
-    body_pose[:, 16 * 3 + 0] = 0.5 + torch.sin(t) * 0.3  # R_Elbow_X: bend
-
-    # L_Shoulder (SMPL joint 13) → body_pose slot 12
-    body_pose[:, 12 * 3 + 0] = torch.sin(t + math.pi) * 0.3  # L_Shoulder_X: counter-motion
-
-    # Spine1 (SMPL joint 3) → body_pose slot 2
-    body_pose[:, 2 * 3 + 0] = torch.sin(t * 2) * 0.05  # Spine1_X: breathing
-
-    # Spine2 (SMPL joint 6) → body_pose slot 5
-    body_pose[:, 5 * 3 + 0] = torch.sin(t * 2) * 0.05  # Spine2_X: breathing
+    body_pose[:, body_pose_slot(R_SHOULDER) + 0] = torch.sin(t) * 0.8   # arm raise
+    body_pose[:, body_pose_slot(R_SHOULDER) + 2] = torch.cos(t) * 0.3   # arm twist
+    body_pose[:, body_pose_slot(R_ELBOW) + 0] = 0.5 + torch.sin(t) * 0.3  # bend
+    body_pose[:, body_pose_slot(L_SHOULDER) + 0] = torch.sin(t + math.pi) * 0.3
+    body_pose[:, body_pose_slot(SPINE1) + 0] = torch.sin(t * 2) * 0.05  # breathing
+    body_pose[:, body_pose_slot(SPINE2) + 0] = torch.sin(t * 2) * 0.05
 
     # Global orientation: slight left-right rotation
     global_orient = torch.zeros(n_frames, 3, device=dev)

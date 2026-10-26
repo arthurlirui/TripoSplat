@@ -215,15 +215,21 @@ class SkinnedGaussians(nn.Module):
         return lambda_reg * ((w - self._weights_ref) ** 2).mean()
 
     def training_setup_weights(self, lr: float = 1e-3):
-        """Add skin weights to the optimizer for joint weight optimization.
+        """Create an optimizer over the skin weights.
 
-        Call this after training_setup() if _weights_optimizable=True.
+        Only meaningful when ``_weights_optimizable=True``; otherwise this is a
+        no-op.  Kept separate from the Gaussian optimizer so the two can use
+        different learning rates.
         """
-        if self._weights_optimizable and self._skin_weights is not None:
-            # Add skin weights to a separate optimizer group.
-            self.optimizers['skin_weights'] = torch.optim.Adam(
-                [{'params': [self._skin_weights], 'lr': lr, 'name': 'skin_weights'}],
-                eps=1e-15)
+        if not self._weights_optimizable or self._skin_weights is None:
+            return None
+        if not hasattr(self, "optimizers"):
+            self.optimizers = {}
+        opt = torch.optim.Adam(
+            [{'params': [self._skin_weights], 'lr': lr, 'name': 'skin_weights'}],
+            eps=1e-15)
+        self.optimizers['skin_weights'] = opt
+        return opt
 
     # ── Export ────────────────────────────────────────────────────────
 
@@ -246,6 +252,16 @@ class SkinnedGaussians(nn.Module):
         rotations = F.normalize(self._quats, dim=-1).cpu().numpy()
         weights = self.skin_weights.cpu().numpy()  # (N, K)
 
+        # Expression basis is part of the rig: without it a reloaded PLY can
+        # move the body but cannot animate the face.
+        has_expr = self._expr_basis is not None and self._expr_basis.numel() > 0
+        if has_expr:
+            expr = self._expr_basis.cpu().numpy()  # (N, n_expr, 3)
+            n_expr = expr.shape[1]
+            # Flatten as (N, 3*n_expr); interleaved so column (j*3+c) is
+            # the j-th basis' c-th component.
+            expr_flat = expr.reshape(N, -1)
+
         # Build attribute names.
         names = ['x', 'y', 'z', 'nx', 'ny', 'nz',
                  'f_dc_0', 'f_dc_1', 'f_dc_2',
@@ -253,12 +269,17 @@ class SkinnedGaussians(nn.Module):
                  'rot_0', 'rot_1', 'rot_2', 'rot_3']
         for k in range(self.n_joints):
             names.append(f'bone_weight_{k}')
+        if has_expr:
+            for j in range(n_expr):
+                for c in range(3):
+                    names.append(f'expr_{j}_{c}')
 
         # Build data array.
-        data = np.concatenate([
-            means_np, normals, f_dc, opacities.reshape(-1, 1),
-            scales, rotations, weights,
-        ], axis=1)
+        blocks = [means_np, normals, f_dc, opacities.reshape(-1, 1),
+                  scales, rotations, weights]
+        if has_expr:
+            blocks.append(expr_flat)
+        data = np.concatenate(blocks, axis=1)
 
         dtype = [(n, 'f4') for n in names]
         elements = np.empty(N, dtype=dtype)
@@ -267,6 +288,71 @@ class SkinnedGaussians(nn.Module):
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el], byte_order='<', text=False).write(path)
         print(f"  Saved {N} skinned Gaussians to {path}")
+
+    @classmethod
+    def load_ply(cls, path: str, device: str = 'cuda',
+                 n_joints: int | None = None,
+                 weights_optimizable: bool = False) -> "SkinnedGaussians":
+        """Load a rig previously written by :meth:`save_ply`.
+
+        Args:
+            path: PLY written by :meth:`save_ply`.
+            device: torch device.
+            n_joints: joint count, inferred from ``bone_weight_*`` when None.
+            weights_optimizable: allow fine-tuning the loaded weights.
+        """
+        from plyfile import PlyData
+        import re
+
+        v = PlyData.read(path)['vertex']
+        names = list(v.data.dtype.names)
+
+        def col(name):
+            return np.asarray(v[name], dtype=np.float32)
+
+        means = np.stack([col('x'), col('y'), col('z')], axis=-1)
+        f_dc = np.stack([col('f_dc_0'), col('f_dc_1'), col('f_dc_2')], axis=-1)
+        sh0 = f_dc[:, None, :]
+        opacities = col('opacity')
+        scales = np.stack([col('scale_0'), col('scale_1'), col('scale_2')], axis=-1)
+        quats = np.stack([col('rot_0'), col('rot_1'), col('rot_2'), col('rot_3')],
+                         axis=-1)
+
+        bone_cols = [n for n in names if re.fullmatch(r'bone_weight_\d+', n)]
+        bone_cols.sort(key=lambda n: int(n.rsplit('_', 1)[1]))
+        n_detected = len(bone_cols)
+        if n_joints is not None and n_joints > n_detected:
+            raise ValueError(
+                f"{path} carries {n_detected} bone weights but n_joints={n_joints} "
+                "was requested.")
+        n_joints = n_detected if n_joints is None else n_joints
+        if n_detected == 0:
+            raise ValueError(f"{path} has no bone_weight_* properties; "
+                             "not a skinned Gaussian PLY.")
+        weights = np.stack([col(n) for n in bone_cols[:n_joints]], axis=-1)
+
+        # Expression bases, if present.
+        expr_cols = [n for n in names if re.fullmatch(r'expr_\d+_\d+', n)]
+        expr_basis = None
+        if expr_cols:
+            expr_cols.sort(key=lambda n: (int(n.split('_')[1]), int(n.split('_')[2])))
+            expr_flat = np.stack([col(n) for n in expr_cols], axis=-1)  # (N, 3*n_expr)
+            expr_basis = torch.from_numpy(
+                expr_flat.reshape(len(means), -1, 3)).float().to(device)
+
+        return cls.from_attributes(
+            means=torch.from_numpy(means).float(),
+            scales_raw=torch.from_numpy(scales).float(),
+            quats=torch.from_numpy(quats).float(),
+            opacities_raw=torch.from_numpy(opacities).float(),
+            sh0=torch.from_numpy(sh0).float(),
+            skin_weights=torch.from_numpy(weights).float(),
+            n_joints=n_joints,
+            sh_degree=0,
+            device=device,
+            expr_basis=expr_basis,
+            weights_optimizable=weights_optimizable,
+        )
 
     @torch.no_grad()
     def save_splat(self, path: str, joint_transforms: Optional[torch.Tensor] = None):

@@ -66,11 +66,22 @@ def sample_gaussians_on_smplx(smplx, n_gaussians=100000, device='cuda'):
     skin_w = skin_w / skin_w.sum(-1, keepdim=True).clamp_min(1e-8)
 
     # Scales, quats, opacity.
-    mesh_size = (v.max(0).values - v.min(0).values).norm().item()
-    scales_raw = torch.log(torch.full((n_gaussians, 3), mesh_size * 0.08, device=device))
+    # Radius follows the mesh's surface area: with N samples spread over A the
+    # mean spacing is sqrt(A/N).  A radius of exactly half the spacing tiles
+    # the surface with no overlap, which at this sampling density projects to
+    # under a pixel and leaves the body mostly transparent; 1.5x spacing
+    # overlaps neighbours enough to close the surface.  A fraction of the
+    # bounding-box diagonal (the previous choice) does not scale with N — at
+    # 80k samples it produced 20 cm discs on a 1.8 m body, which render as an
+    # opaque blob with no visible limbs.
+    v0, v1, v2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    area = 0.5 * torch.cross(v1 - v0, v2 - v0, dim=-1).norm(dim=-1).sum().item()
+    spacing = math.sqrt(area / max(n_gaussians, 1))
+    radius = 1.5 * spacing
+    scales_raw = torch.log(torch.full((n_gaussians, 3), radius, device=device))
     quats = torch.zeros(n_gaussians, 4, device=device)
     quats[:, 0] = 1.0
-    opac_raw = torch.full((n_gaussians,), math.log(0.9 / 0.1), device=device)
+    opac_raw = torch.full((n_gaussians,), math.log(0.95 / 0.05), device=device)
 
     # Colors: skin tone with slight variation.
     r = 0.65 + torch.rand(n_gaussians, device=device) * 0.15
@@ -79,7 +90,8 @@ def sample_gaussians_on_smplx(smplx, n_gaussians=100000, device='cuda'):
     colors = torch.stack([r, g, b], dim=-1)
     sh0 = ((colors - 0.5) / SH_C0)[:, None, :]
 
-    print(f"  Sampled {n_gaussians} Gaussians on SMPL-X mesh ({mesh_size:.2f}m)")
+    print(f"  Sampled {n_gaussians} Gaussians on SMPL-X mesh "
+          f"(area {area:.2f} m², radius {radius * 100:.1f} cm)")
     return means, scales_raw, quats, opac_raw, sh0, skin_w
 
 
@@ -89,7 +101,15 @@ def make_orbit_cameras(smplx, n_frames, device='cuda'):
 
     v, _ = smplx.get_rest_mesh()
     centre = v.median(0).values
-    radius = 4.0
+    # Frame the body from its projected height: a subject of height h at
+    # distance d covers fx*h/d pixels, so to fill 75% of the frame we need
+    # d = fx*h/(0.75*H).  The old fixed 4.0 m left the figure at a third of
+    # frame height, which reads as "rendering is broken" rather than "camera
+    # is far away".
+    W, H = 1024, 768
+    fx = 800.0
+    height = (v[:, 1].max() - v[:, 1].min()).item()
+    radius = fx * height / (0.95 * H)
     elev = math.radians(10)  # slightly above
 
     cameras = []
@@ -116,8 +136,6 @@ def make_orbit_cameras(smplx, n_frames, device='cuda'):
         c2w[:3, 3] = pos
         w2c = invert_se3(c2w)
 
-        W, H = 1024, 768
-        fx = 800.0
         cameras.append(Camera(
             w2c=w2c, c2w=c2w, position=pos,
             fx=fx, fy=fx, cx=W / 2, cy=H / 2,
@@ -286,7 +304,9 @@ def main():
     # ── 8. Save key frames ──
     print(f"\nStep 8: Save key frames")
     # Re-render a few key frames at higher quality for screenshots.
-    key_frames = [0, 60, 120, 180]
+    # Spread them across the sequence so short runs still produce useful frames.
+    key_frames = sorted({int(round(f * (args.n_frames - 1)))
+                         for f in (0.0, 0.25, 0.5, 0.75)})
     for idx in key_frames:
         T = smplx.get_joint_transforms(
             betas=pose_seq['betas'],
@@ -312,7 +332,7 @@ def main():
     # ── 10. Verify animation effect ──
     print(f"\nStep 10: Verify animation")
     per_gs_diffs = []
-    for idx in [30, 60, 120, 180]:
+    for idx in key_frames[1:] or key_frames:
         T = smplx.get_joint_transforms(
             betas=pose_seq['betas'],
             body_pose=pose_seq['body_pose'][idx],
@@ -326,7 +346,7 @@ def main():
     print(f"\n{'=' * 70}")
     print(f"Done! Outputs in {args.output_dir}/:")
     print(f"  smplx_demo.mp4          — {args.n_frames} frames, orbit camera + actions")
-    print(f"  frame_000/060/120/180.png — key frame screenshots")
+    print(f"  frame_*.png             — key frame screenshots")
     print(f"  skinned_gaussians.ply   — rigged Gaussians (55 joints + expression)")
     print(f"{'=' * 70}")
 

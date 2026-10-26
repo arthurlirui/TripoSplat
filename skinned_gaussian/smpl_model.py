@@ -14,6 +14,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .joints import match_body_pose
+
 
 class SMPLWrapper:
     """Lightweight SMPL model that provides per-joint transformation matrices.
@@ -205,6 +207,9 @@ class SMPLWrapper:
             betas = torch.zeros(self.NUM_BETAS, device=self.device)
         if body_pose is None:
             body_pose = torch.zeros(69, device=self.device)
+        else:
+            # Accept the shared 63-dim layout authored for SMPL-X.
+            body_pose = match_body_pose(body_pose, 69)
         if global_orient is None:
             global_orient = torch.zeros(3, device=self.device)
         if transl is None:
@@ -288,7 +293,7 @@ class SMPLWrapper:
         # For simplicity, we use the direct posedirs formulation:
         #   pose_blends = posedirs @ (pose_feature)
         # where pose_feature is built from the axis-angle pose.
-        pose_feat = full_pose[1:]  # (69,) = 23*3, skip root
+        pose_feat = full_pose[3:]  # (69,) = 23*3, skip the 3 root values
         # Build (23, 9) pose feature: for each joint (px,py,pz):
         # [px, py, pz, px*px, px*py, px*pz, py*py, py*pz, pz*pz]
         # But SMPL's posedirs expect a specific ordering. The standard smplx

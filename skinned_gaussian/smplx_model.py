@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from .smpl_model import SMPLWrapper
+from .joints import match_body_pose
 
 
 class SMPLXWrapper:
@@ -196,6 +197,9 @@ class SMPLXWrapper:
             betas = torch.zeros(self.NUM_BETAS, device=self.device)
         if body_pose is None:
             body_pose = torch.zeros(63, device=self.device)
+        else:
+            # Accept SMPL's 69-dim layout too; the two hand slots are dropped.
+            body_pose = match_body_pose(body_pose, 63)
         if global_orient is None:
             global_orient = torch.zeros(3, device=self.device)
         if transl is None:
